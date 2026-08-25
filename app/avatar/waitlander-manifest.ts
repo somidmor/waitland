@@ -16,12 +16,14 @@ export const WAITLANDER_RUNTIME_MANIFEST = {
     fadeSeconds: 0.16,
     walkTimeScale: 0.92,
     interactTimeScale: 4.5,
+    lockScale: true,
+    rebaseHips: true,
   },
   normalization: {
     targetHeight: 3.05,
     centerXZ: true,
     ground: true,
-    sourceForward: "-z",
+    sourceForward: "+z",
   },
   anchors: {
     heldItem: { bone: "rightHand" },

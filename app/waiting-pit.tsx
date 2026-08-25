@@ -32,7 +32,11 @@ import { createProceduralAvatar, type RiggedAvatarRuntime } from "./avatar";
 import { createAvatarAppearance } from "./avatar-design";
 import { WAITLANDER_RUNTIME_MANIFEST } from "./avatar/waitlander-manifest";
 import { CompassIcon, EditIcon, PeopleIcon, SendIcon, StoneIcon } from "./ui-icons";
-import { createStorybookWorld } from "./world-art";
+import {
+  attachEnvironmentMaterialTextures,
+  createStorybookWorld,
+  ENVIRONMENT_TEXTURE_PATHS,
+} from "./world-art";
 
 const CAPACITY = PIT_CAPACITY;
 const PIT_RADIUS = 4.6;
@@ -153,8 +157,8 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     scene.background = null;
     scene.fog = new THREE.Fog(0xe8bb78, 42, 118);
 
-    const camera = new THREE.PerspectiveCamera(43, 1, 0.1, 160);
-    camera.position.set(0, 11.5, 32.5);
+    const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 160);
+    camera.position.set(0, 12, 36);
 
     let renderer: THREE.WebGLRenderer | null = null;
     let worldFallback: HTMLDivElement | null = null;
@@ -200,17 +204,49 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     const pitGroup = new THREE.Group();
     scene.add(pitGroup);
 
-    const pitFloorMaterial = new THREE.MeshStandardMaterial({ color: 0x493a2a, roughness: 1 });
-    const pitFloor = new THREE.Mesh(new THREE.CircleGeometry(PIT_RADIUS, 64), pitFloorMaterial);
+    const pitFloorMaterial = new THREE.MeshStandardMaterial({
+      color: 0x6b5136,
+      roughness: 1,
+      metalness: 0,
+    });
+    const pitFloor = new THREE.Mesh(
+      new THREE.CircleGeometry(PIT_RADIUS + 0.04, 64),
+      pitFloorMaterial,
+    );
     pitFloor.rotation.x = -Math.PI / 2;
-    pitFloor.position.y = 0.03;
+    pitFloor.position.y = -0.34;
     pitFloor.receiveShadow = true;
     pitGroup.add(pitFloor);
 
-    const pitRimMaterial = new THREE.MeshStandardMaterial({ color: 0x82623e, roughness: 1 });
-    const pitRim = new THREE.Mesh(new THREE.TorusGeometry(5.18, 0.82, 10, 64), pitRimMaterial);
+    const pitRimMaterial = new THREE.MeshStandardMaterial({
+      color: 0x977149,
+      roughness: 1,
+      metalness: 0,
+    });
+    const pitWallGeometry = new THREE.CylinderGeometry(
+      5.02,
+      PIT_RADIUS + 0.04,
+      0.72,
+      64,
+      1,
+      true,
+    );
+    const pitWallMaterial = new THREE.MeshStandardMaterial({
+      color: 0x745238,
+      roughness: 1,
+      metalness: 0,
+      // Cylinder normals face away from the excavation. Render the inward
+      // surface so the wall remains visible from the gameplay camera.
+      side: THREE.BackSide,
+    });
+    const pitWall = new THREE.Mesh(pitWallGeometry, pitWallMaterial);
+    pitWall.position.y = 0.02;
+    pitWall.receiveShadow = true;
+    pitGroup.add(pitWall);
+
+    const pitRim = new THREE.Mesh(new THREE.TorusGeometry(5.14, 0.74, 10, 64), pitRimMaterial);
     pitRim.rotation.x = Math.PI / 2;
-    pitRim.position.y = 0.3;
+    pitRim.position.y = 0.28;
     pitRim.castShadow = true;
     pitRim.receiveShadow = true;
     pitGroup.add(pitRim);
@@ -226,7 +262,11 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     pitGroup.add(innerRim);
 
     const rimClumpGeometry = new THREE.DodecahedronGeometry(0.72, 0);
-    const rimClumpMaterial = new THREE.MeshStandardMaterial({ color: 0x8b6943, roughness: 1 });
+    const rimClumpMaterial = new THREE.MeshStandardMaterial({
+      color: 0xa17b4f,
+      roughness: 1,
+      metalness: 0,
+    });
     const rimClumps = new THREE.InstancedMesh(rimClumpGeometry, rimClumpMaterial, 30);
     const rimClumpTransform = new THREE.Object3D();
     for (let index = 0; index < rimClumps.count; index += 1) {
@@ -246,6 +286,17 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     rimClumps.receiveShadow = true;
     rimClumps.castShadow = false;
     pitGroup.add(rimClumps);
+
+    const pitTextureBinding = attachEnvironmentMaterialTextures(
+      [
+        { material: pitFloorMaterial, texturedColor: 0x8a755c },
+        { material: pitWallMaterial, texturedColor: 0x92704f },
+        { material: pitRimMaterial, texturedColor: 0xc7a475 },
+        { material: rimClumpMaterial, texturedColor: 0xb99668 },
+      ],
+      ENVIRONMENT_TEXTURE_PATHS.pit,
+      { repeat: 3, normalScale: 0.38 },
+    );
 
     const stoneGeometry = new THREE.DodecahedronGeometry(0.38, 0);
     const stoneMaterials = [
@@ -314,7 +365,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         const lift = Math.max(0, (nextCount / CAPACITY) * 2.25 - radius * 0.18);
         pitPileTransform.position.set(
           Math.cos(angle) * radius,
-          0.26 + lift,
+          -0.1 + lift,
           Math.sin(angle) * radius,
         );
         pitPileTransform.rotation.set(
@@ -407,6 +458,9 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       | undefined;
 
     const worldForward = new THREE.Vector3(0, 0, -1);
+    const worldUp = new THREE.Vector3(0, 1, 0);
+    const cameraForward = new THREE.Vector3(0, 0, -1);
+    const cameraRight = new THREE.Vector3(1, 0, 0);
     const desiredCameraPosition = new THREE.Vector3();
     const cameraLookTarget = new THREE.Vector3();
     const speechAnchor = new THREE.Vector3();
@@ -1135,10 +1189,17 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           setHasMoved(true);
         }
         const normalizedX = inputX / Math.max(1, inputLength);
-        const normalizedZ = -inputY / Math.max(1, inputLength);
+        const normalizedY = inputY / Math.max(1, inputLength);
+        camera.getWorldDirection(cameraForward);
+        cameraForward.y = 0;
+        if (cameraForward.lengthSq() < 0.001) cameraForward.set(0, 0, -1);
+        else cameraForward.normalize();
+        cameraRight.crossVectors(cameraForward, worldUp).normalize();
+        const movementX = cameraRight.x * normalizedX + cameraForward.x * normalizedY;
+        const movementZ = cameraRight.z * normalizedX + cameraForward.z * normalizedY;
         const speed = heldRock ? CARRY_SPEED : WALK_SPEED;
-        const nextX = player.position.x + normalizedX * speed * dt;
-        const nextZ = player.position.z + normalizedZ * speed * dt;
+        const nextX = player.position.x + movementX * speed * dt;
+        const nextZ = player.position.z + movementZ * speed * dt;
         const nextDistanceFromCenter = Math.hypot(nextX, nextZ);
 
         if (nextDistanceFromCenter < PIT_WALL_RADIUS) {
@@ -1150,7 +1211,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           player.position.z = nextZ;
         }
 
-        const targetRotation = Math.atan2(-normalizedX, -normalizedZ);
+        const targetRotation = Math.atan2(-movementX, -movementZ);
         let rotationDelta = targetRotation - player.rotation.y;
         rotationDelta = Math.atan2(Math.sin(rotationDelta), Math.cos(rotationDelta));
         player.rotation.y += rotationDelta * Math.min(1, dt * 12);
@@ -1254,9 +1315,24 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         setDistanceToPit(pitDistance);
       }
 
-      desiredCameraPosition.set(player.position.x, player.position.y + 11.2, player.position.z + 13.2);
+      const distanceFromPit = Math.max(0.001, Math.hypot(player.position.x, player.position.z));
+      const outwardX = player.position.x / distanceFromPit;
+      const outwardZ = player.position.z / distanceFromPit;
+      desiredCameraPosition.set(
+        player.position.x + outwardX * 18,
+        player.position.y + 12,
+        player.position.z + outwardZ * 18,
+      );
       camera.position.lerp(desiredCameraPosition, 1 - Math.pow(0.001, dt));
-      cameraLookTarget.set(player.position.x, 1.25, player.position.z - 1.6);
+      // Keep the pit and path in the composition while placing the hero in the
+      // lower third. Movement is mapped through this camera yaw above, so the
+      // joystick remains screen-relative as the view orbits the objective.
+      const lookAhead = Math.min(distanceFromPit * 0.5, 12);
+      cameraLookTarget.set(
+        player.position.x - outwardX * lookAhead,
+        1.8,
+        player.position.z - outwardZ * lookAhead,
+      );
       camera.lookAt(cameraLookTarget);
       camera.updateMatrixWorld();
       storybookWorld.update(clock.elapsedTime);
@@ -1312,12 +1388,14 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       window.removeEventListener("blur", releaseInputs);
       window.removeEventListener("pagehide", onPageHide);
       document.removeEventListener("visibilitychange", onVisibilityChange);
-      renderer?.dispose();
       storybookWorld.dispose();
+      pitTextureBinding.dispose();
       stoneGeometry.dispose();
       stoneMaterials.forEach((material) => material.dispose());
       pitFloor.geometry.dispose();
       pitFloorMaterial.dispose();
+      pitWallGeometry.dispose();
+      pitWallMaterial.dispose();
       pitRim.geometry.dispose();
       pitRimMaterial.dispose();
       innerRim.geometry.dispose();
@@ -1326,6 +1404,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       rimClumpMaterial.dispose();
       riggedAvatar?.dispose();
       localAvatar.dispose();
+      renderer?.dispose();
       if (renderer?.domElement.parentElement === mount) mount.removeChild(renderer.domElement);
       worldFallback?.remove();
     };

@@ -3,6 +3,109 @@ import { FIELD_RADIUS } from "../shared/world";
 
 type Disposable = { dispose: () => void };
 
+export const ENVIRONMENT_TEXTURE_PATHS = {
+  grass: {
+    baseColor: "/assets/environment/v1/meadow-grass-albedo.jpg",
+    // Optional future linear channels: meadow-grass-normal.png and
+    // meadow-grass-roughness.png. Keep null until those files are authored.
+    normal: null,
+    roughness: null,
+  },
+  pit: {
+    baseColor: "/assets/environment/v1/pit-earth-albedo.jpg",
+    // Optional future linear channels: pit-earth-normal.png and
+    // pit-earth-roughness.png. Albedo must never be reused as either channel.
+    normal: null,
+    roughness: null,
+  },
+} as const;
+
+type EnvironmentTexturePaths = (typeof ENVIRONMENT_TEXTURE_PATHS)[keyof typeof ENVIRONMENT_TEXTURE_PATHS];
+
+export type EnvironmentMaterialTarget = {
+  material: THREE.MeshStandardMaterial;
+  texturedColor?: THREE.ColorRepresentation;
+};
+
+export type EnvironmentTextureBinding = Disposable;
+
+/**
+ * Adds an optional tileable material set without weakening the solid-colour
+ * fallback. Available channels are shared by every target, loaded only in a
+ * browser, and applied together so a missing file never produces a black mesh.
+ */
+export function attachEnvironmentMaterialTextures(
+  targets: readonly EnvironmentMaterialTarget[],
+  paths: EnvironmentTexturePaths,
+  options: { repeat: number; normalScale: number },
+): EnvironmentTextureBinding {
+  let disposed = false;
+  const textures = new Set<THREE.Texture>();
+
+  if (typeof document === "undefined") {
+    return { dispose: () => undefined };
+  }
+
+  const loader = new THREE.TextureLoader();
+  const load = async (path: string, colorSpace: THREE.ColorSpace) => {
+    try {
+      const texture = await loader.loadAsync(path);
+      texture.wrapS = THREE.RepeatWrapping;
+      texture.wrapT = THREE.RepeatWrapping;
+      texture.repeat.setScalar(options.repeat);
+      texture.colorSpace = colorSpace;
+      texture.anisotropy = 2;
+      texture.magFilter = THREE.LinearFilter;
+      texture.minFilter = THREE.LinearMipmapLinearFilter;
+      texture.generateMipmaps = true;
+      texture.needsUpdate = true;
+      return texture;
+    } catch {
+      return null;
+    }
+  };
+  const loadOptional = (path: string | null, colorSpace: THREE.ColorSpace) =>
+    path ? load(path, colorSpace) : Promise.resolve(null);
+
+  void Promise.all([
+    load(paths.baseColor, THREE.SRGBColorSpace),
+    loadOptional(paths.normal, THREE.NoColorSpace),
+    loadOptional(paths.roughness, THREE.NoColorSpace),
+  ]).then(([baseColor, normal, roughness]) => {
+    const loaded = [baseColor, normal, roughness].filter(
+      (texture): texture is THREE.Texture => texture !== null,
+    );
+    if (disposed) {
+      loaded.forEach((texture) => texture.dispose());
+      return;
+    }
+
+    loaded.forEach((texture) => textures.add(texture));
+    for (const target of targets) {
+      if (baseColor) {
+        target.material.map = baseColor;
+        if (target.texturedColor !== undefined) {
+          target.material.color.set(target.texturedColor);
+        }
+      }
+      if (normal) {
+        target.material.normalMap = normal;
+        target.material.normalScale.setScalar(options.normalScale);
+      }
+      if (roughness) target.material.roughnessMap = roughness;
+      if (loaded.length > 0) target.material.needsUpdate = true;
+    }
+  });
+
+  return {
+    dispose() {
+      disposed = true;
+      textures.forEach((texture) => texture.dispose());
+      textures.clear();
+    },
+  };
+}
+
 export type StorybookWorld = {
   update: (elapsedSeconds: number) => void;
   dispose: () => void;
@@ -114,87 +217,6 @@ function isNearPath(x: number, z: number, samples: readonly THREE.Vector3[], cle
   return false;
 }
 
-function makeGuardian() {
-  const guardian = new THREE.Group();
-  guardian.name = "the-waiting-guardian";
-  guardian.position.set(0, 0.1, -34);
-  guardian.rotation.y = 0.12;
-
-  const stone = new THREE.MeshStandardMaterial({
-    color: 0x938b72,
-    roughness: 1,
-    metalness: 0,
-  });
-  const shadowStone = new THREE.MeshStandardMaterial({
-    color: 0x746c58,
-    roughness: 1,
-    metalness: 0,
-  });
-
-  const hill = new THREE.Mesh(
-    new THREE.SphereGeometry(7.8, 28, 12),
-    new THREE.MeshStandardMaterial({ color: 0x7f8654, roughness: 1 }),
-  );
-  hill.scale.set(1.45, 0.23, 0.7);
-  hill.position.y = -1.55;
-  hill.receiveShadow = true;
-  guardian.add(hill);
-
-  const base = new THREE.Mesh(new THREE.CylinderGeometry(2.6, 3, 0.72, 10), shadowStone);
-  base.position.y = 0.38;
-  base.castShadow = true;
-  guardian.add(base);
-
-  const body = new THREE.Mesh(new THREE.CapsuleGeometry(1.22, 1.9, 7, 13), stone);
-  body.position.y = 2.05;
-  body.scale.set(1.18, 1, 0.84);
-  body.castShadow = true;
-  guardian.add(body);
-
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.92, 18, 14), stone);
-  head.position.set(0, 4.25, 0);
-  head.scale.set(0.94, 1.04, 0.9);
-  head.castShadow = true;
-  guardian.add(head);
-
-  const hair = new THREE.Mesh(
-    new THREE.SphereGeometry(0.99, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.62),
-    shadowStone,
-  );
-  hair.position.set(0, 4.49, -0.08);
-  hair.scale.set(1.03, 0.9, 1.04);
-  guardian.add(hair);
-
-  const armGeometry = new THREE.CapsuleGeometry(0.28, 1.5, 5, 9);
-  const leftArm = new THREE.Mesh(armGeometry, stone);
-  const rightArm = new THREE.Mesh(armGeometry, stone);
-  leftArm.position.set(-1.03, 2.35, 0.42);
-  rightArm.position.set(1.03, 2.35, 0.42);
-  leftArm.rotation.set(-0.22, 0, -0.84);
-  rightArm.rotation.set(-0.22, 0, 0.84);
-  leftArm.castShadow = true;
-  rightArm.castShadow = true;
-  guardian.add(leftArm, rightArm);
-
-  const heldStone = new THREE.Mesh(new THREE.DodecahedronGeometry(0.56, 0), shadowStone);
-  heldStone.position.set(0, 1.95, 0.95);
-  heldStone.scale.set(1.08, 0.86, 0.95);
-  heldStone.castShadow = true;
-  guardian.add(heldStone);
-
-  const eyeGeometry = new THREE.SphereGeometry(0.055, 8, 6);
-  const eyeMaterial = new THREE.MeshBasicMaterial({ color: 0x514c40 });
-  for (const side of [-1, 1]) {
-    const eye = new THREE.Mesh(eyeGeometry, eyeMaterial);
-    eye.position.set(side * 0.27, 4.35, 0.79);
-    eye.scale.set(1, 0.34, 0.4);
-    guardian.add(eye);
-  }
-
-  guardian.scale.setScalar(0.88);
-  return guardian;
-}
-
 /**
  * Adds the warm, low-detail meadow around the interactive layer. All repeated
  * scenery is instanced so the richer art direction stays inexpensive on phones.
@@ -213,9 +235,13 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
 
   const transform = new THREE.Object3D();
 
-  // A slightly warmer outer meadow lets the playable field fall away into the
-  // sunlit horizon without a texture or another light pass.
-  const groundGeometry = remember(new THREE.CircleGeometry(FIELD_RADIUS + 24, 112));
+  // One continuous ground surface avoids a visible material seam at the field
+  // edge and lets the optional tileable grass set stay shared in GPU memory.
+  // Leave the playable pit opening physically clear; an opaque circle here
+  // would depth-occlude the recessed wall, floor, and deposited stones.
+  const groundGeometry = remember(
+    new THREE.RingGeometry(4.52, FIELD_RADIUS + 24, 112, 1),
+  );
   const groundMaterial = remember(
     new THREE.MeshStandardMaterial({ color: 0x9b915d, roughness: 1, metalness: 0 }),
   );
@@ -225,18 +251,16 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
   ground.receiveShadow = true;
   root.add(ground);
 
-  const meadowGeometry = remember(new THREE.CircleGeometry(FIELD_RADIUS + 4, 112));
-  const meadowMaterial = remember(
-    new THREE.MeshStandardMaterial({ color: 0x888b4c, roughness: 1, metalness: 0 }),
+  remember(
+    attachEnvironmentMaterialTextures(
+      [{ material: groundMaterial, texturedColor: 0xffffff }],
+      ENVIRONMENT_TEXTURE_PATHS.grass,
+      { repeat: 16, normalScale: 0.24 },
+    ),
   );
-  const meadow = new THREE.Mesh(meadowGeometry, meadowMaterial);
-  meadow.position.y = -0.01;
-  meadow.rotation.x = -Math.PI / 2;
-  meadow.receiveShadow = true;
-  root.add(meadow);
 
   // The path deliberately curls around the pit's collision radius before
-  // continuing toward the guardian. It is visual guidance, not geometry that
+  // fading into the far meadow. It is visual guidance, not geometry that
   // movement or multiplayer state needs to know about.
   const pathPoints = [
     new THREE.Vector3(-5.5, 0, FIELD_RADIUS + 7),
@@ -302,7 +326,6 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
       transparent: true,
       opacity: 0.13,
       depthWrite: false,
-      vertexColors: true,
       toneMapped: false,
     }),
   );
@@ -340,7 +363,6 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
     // aliasing produced by thin vertical geometry at the gameplay camera.
     new THREE.MeshBasicMaterial({
       color: 0xffffff,
-      vertexColors: true,
       transparent: true,
       opacity: 0.44,
       depthWrite: false,
@@ -426,7 +448,7 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
   // so two depth layers still cost a single scenery draw call.
   const hillGeometry = remember(new THREE.SphereGeometry(1, 18, 9));
   const hillMaterial = remember(
-    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, vertexColors: true }),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 }),
   );
   const hills = new THREE.InstancedMesh(hillGeometry, hillMaterial, 28);
   const nearHillColors = [
@@ -513,7 +535,6 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
     new THREE.MeshStandardMaterial({
       color: 0xffffff,
       roughness: 1,
-      vertexColors: true,
       emissive: 0x4d5336,
       emissiveIntensity: 0.16,
     }),
@@ -586,7 +607,7 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
   // clusters without competing with interactive field stones.
   const decorativeRockGeometry = remember(new THREE.DodecahedronGeometry(0.46, 0));
   const decorativeRockMaterial = remember(
-    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1, vertexColors: true }),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 }),
   );
   const decorativeRocks = new THREE.InstancedMesh(
     decorativeRockGeometry,
@@ -689,15 +710,6 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
   clouds.renderOrder = -2;
   root.add(clouds);
 
-  const guardian = makeGuardian();
-  root.add(guardian);
-  guardian.traverse((child) => {
-    const mesh = child as THREE.Mesh;
-    if (mesh.geometry) disposable.add(mesh.geometry);
-    const materials = Array.isArray(mesh.material) ? mesh.material : mesh.material ? [mesh.material] : [];
-    for (const material of materials) disposable.add(material);
-  });
-
   const cloudBaseY = clouds.position.y;
   const hazeBaseY = haze.position.y;
   return {
@@ -706,7 +718,6 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
       clouds.rotation.y = Math.sin(elapsedSeconds * 0.025) * 0.006;
       haze.position.y = hazeBaseY + Math.sin(elapsedSeconds * 0.1 + 0.8) * 0.08;
       haze.rotation.y = -Math.sin(elapsedSeconds * 0.018) * 0.004;
-      guardian.rotation.y = 0.12 + Math.sin(elapsedSeconds * 0.08) * 0.018;
     },
     dispose() {
       scene.remove(root);

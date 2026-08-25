@@ -3,7 +3,7 @@ import {
   createAvatarAppearance,
   hairStyleMetrics,
   type AvatarAppearance,
-} from "./avatar-design";
+} from "./avatar-design.ts";
 
 export const MAX_REMOTE_PLAYERS = 64;
 const DEPARTURE_DURATION_MS = 2_650;
@@ -185,11 +185,15 @@ export class RemoteAvatarRenderer {
   private readonly wingGeometry = makeWingGeometry();
   private readonly moteGeometry = new THREE.SphereGeometry(0.052, 6, 4);
 
-  private readonly sweaterMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.96, vertexColors: true });
-  private readonly skinMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95, vertexColors: true });
-  private readonly hairMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98, vertexColors: true });
-  private readonly trouserMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98, vertexColors: true });
-  private readonly shoeMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98, vertexColors: true });
+  // InstancedMesh supplies instanceColor independently. Enabling vertexColors
+  // here would also require a color attribute on every source geometry; these
+  // procedural primitives intentionally have none, so the shader would
+  // multiply every per-instance tint by the default black vertex value.
+  private readonly sweaterMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.96 });
+  private readonly skinMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 });
+  private readonly hairMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98 });
+  private readonly trouserMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98 });
+  private readonly shoeMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98 });
   private readonly faceMaterial = new THREE.MeshBasicMaterial({ color: 0x2b211b });
   private readonly glassesMaterial = new THREE.MeshBasicMaterial({ color: 0x342d27 });
   private readonly mouthMaterial = new THREE.MeshBasicMaterial({ color: 0x5b352b });

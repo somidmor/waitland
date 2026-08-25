@@ -5,6 +5,7 @@ import {
   clearRiggedAvatarCache,
   loadRiggedAvatar,
   riggedAvatarCacheKey,
+  riggedAvatarForwardCorrection,
 } from "../app/avatar/rigged-avatar-runtime.ts";
 
 function createTemplate() {
@@ -171,4 +172,103 @@ test("rigged avatar failures are explicit so callers can choose the procedural f
     assert.equal(legacyResult.avatar.playInteraction(), false);
     legacyResult.avatar.dispose();
   }
+});
+
+test("clip preparation keeps one bind-pose scale and origin across animation sources", async () => {
+  clearRiggedAvatarCache();
+  const source = createTemplate();
+  const hips = source.scene.getObjectByName("mixamorig:Hips");
+  hips.removeFromParent();
+  hips.name = "Hips";
+  const boundsMarker = new THREE.Mesh(
+    source.geometry,
+    new THREE.MeshStandardMaterial({ color: 0xffffff }),
+  );
+  boundsMarker.position.y = 1;
+  hips.add(boundsMarker);
+  source.scene.clear();
+  source.scene.add(hips);
+  source.animations = [
+    new THREE.AnimationClip("Idle", 1, [
+      new THREE.VectorKeyframeTrack(
+        "Hips.scale",
+        [0, 1],
+        [1.17647, 1.17647, 1.17647, 1.17647, 1.17647, 1.17647],
+      ),
+      new THREE.VectorKeyframeTrack(
+        "Hips.position",
+        [0, 1],
+        [2, 6, 3, 2, 7, 3],
+      ),
+    ]),
+    new THREE.AnimationClip("Walking", 1, [
+      new THREE.VectorKeyframeTrack(
+        "Hips.scale",
+        [0, 1],
+        [0.8, 0.8, 0.8, 0.8, 0.8, 0.8],
+      ),
+      new THREE.VectorKeyframeTrack(
+        "Hips.position",
+        [0, 1],
+        [-1, -2, 0.5, -1, -1, 0.5],
+      ),
+    ]),
+  ];
+  const assetManifest = manifest(5);
+  assetManifest.animations.fadeSeconds = 0;
+  assetManifest.animations.lockScale = true;
+  assetManifest.animations.rebaseHips = true;
+
+  const result = await loadRiggedAvatar(assetManifest, {
+    useCache: false,
+    loaderFactory: () => ({
+      async loadAsync() {
+        return { scene: source.scene, animations: source.animations };
+      },
+    }),
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const avatar = result.avatar;
+  const idleHeight = new THREE.Box3()
+    .setFromObject(avatar.root, true)
+    .getSize(new THREE.Vector3()).y;
+  assert.deepEqual(avatar.bones.hips?.scale.toArray(), [1, 1, 1]);
+  assert.deepEqual(avatar.bones.hips?.position.toArray(), [0, 0, 0]);
+  assert.ok(avatar.clips.idle?.tracks.every((track) => !track.name.endsWith(".scale")));
+  assert.ok(avatar.clips.walk.tracks.every((track) => !track.name.endsWith(".scale")));
+  assert.deepEqual(
+    Array.from(avatar.clips.idle?.tracks[0].values.slice(0, 3) ?? []),
+    [0, 0, 0],
+  );
+  assert.deepEqual(Array.from(avatar.clips.walk.tracks[0].values.slice(0, 3)), [0, 0, 0]);
+
+  avatar.setMotion({ moving: true, speed: 1 }, 0);
+  avatar.update(0);
+  const walkHeight = new THREE.Box3()
+    .setFromObject(avatar.root, true)
+    .getSize(new THREE.Vector3()).y;
+  assert.deepEqual(avatar.bones.hips?.scale.toArray(), [1, 1, 1]);
+  assert.deepEqual(avatar.bones.hips?.position.toArray(), [0, 0, 0]);
+  assert.ok(
+    Math.abs(walkHeight - idleHeight) < 0.000001,
+    `bounds changed from ${idleHeight} to ${walkHeight}`,
+  );
+
+  assert.equal(source.animations[0].tracks.length, 2, "cached source clips stay immutable");
+  assert.ok(Math.abs(source.animations[0].tracks[0].values[0] - 1.17647) < 0.000001);
+  assert.equal(source.animations[0].tracks[1].values[1], 6);
+  avatar.dispose();
+});
+
+test("forward-axis correction maps an authored +Z face onto gameplay -Z", () => {
+  const authoredForward = new THREE.Vector3(0, 0, 1);
+  authoredForward.applyAxisAngle(
+    new THREE.Vector3(0, 1, 0),
+    riggedAvatarForwardCorrection("+z"),
+  );
+  assert.ok(Math.abs(authoredForward.x) < 0.000001);
+  assert.ok(Math.abs(authoredForward.z + 1) < 0.000001);
+  assert.equal(riggedAvatarForwardCorrection("-z"), 0);
 });

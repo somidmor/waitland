@@ -61,6 +61,17 @@ export type RiggedAvatarManifest = {
     fadeSeconds?: number;
     walkTimeScale?: number;
     interactTimeScale?: number;
+    /**
+     * Removes authored scale keyframes from every selected clip. Enable this
+     * when animations were combined from separately normalized versions of the
+     * same rig, so locomotion never changes the character's proportions.
+     */
+    lockScale?: boolean;
+    /**
+     * Offsets each Hips position track to begin at the rig's bind-pose
+     * position, while preserving the motion authored within the clip.
+     */
+    rebaseHips?: boolean;
   };
   normalization?: {
     /** Defaults to the procedural character's approximate three-unit height. */
@@ -306,6 +317,78 @@ export function resolveRiggedAvatarClips(
   };
 }
 
+function isScaleTrack(track: THREE.KeyframeTrack) {
+  try {
+    return THREE.PropertyBinding.parseTrackName(track.name).propertyName === "scale";
+  } catch {
+    return /(?:^|\.)scale(?:\[|$)/.test(track.name);
+  }
+}
+
+function rebaseHipsPositionTrack(track: THREE.KeyframeTrack, hips: THREE.Bone) {
+  let binding: ReturnType<typeof THREE.PropertyBinding.parseTrackName>;
+  try {
+    binding = THREE.PropertyBinding.parseTrackName(track.name);
+  } catch {
+    return;
+  }
+  const targetName = binding.nodeName?.split("/").at(-1);
+  const namesHips =
+    normalizedName(targetName ?? "") === normalizedName(hips.name) ||
+    normalizedName(binding.objectIndex ?? "") === normalizedName(hips.name);
+  const valueSize = track.getValueSize();
+  if (binding.propertyName !== "position" || !namesHips || valueSize < 3) return;
+
+  const offsets = [
+    hips.position.x - Number(track.values[0]),
+    hips.position.y - Number(track.values[1]),
+    hips.position.z - Number(track.values[2]),
+  ];
+  for (let offset = 0; offset < track.values.length; offset += valueSize) {
+    track.values[offset] += offsets[0];
+    track.values[offset + 1] += offsets[1];
+    track.values[offset + 2] += offsets[2];
+  }
+}
+
+/**
+ * Returns per-runtime clips with scale animation removed when requested. The
+ * decoded GLTF clips stay immutable and can remain shared in the loader cache.
+ */
+export function prepareRiggedAvatarClips(
+  clips: RiggedAvatarResolvedClips,
+  manifest: RiggedAvatarManifest,
+  hips?: THREE.Bone,
+): RiggedAvatarResolvedClips {
+  if (!manifest.animations.lockScale && !(manifest.animations.rebaseHips && hips)) {
+    return clips;
+  }
+
+  const stabilized = new Map<THREE.AnimationClip, THREE.AnimationClip>();
+  const prepareClip = (clip: THREE.AnimationClip | undefined) => {
+    if (!clip) return undefined;
+    const cached = stabilized.get(clip);
+    if (cached) return cached;
+    const clone = clip.clone();
+    if (manifest.animations.lockScale) {
+      clone.tracks = clone.tracks.filter((track) => !isScaleTrack(track));
+    }
+    if (manifest.animations.rebaseHips && hips) {
+      for (const track of clone.tracks) rebaseHipsPositionTrack(track, hips);
+    }
+    stabilized.set(clip, clone);
+    return clone;
+  };
+
+  return {
+    walk: prepareClip(clips.walk)!,
+    idle: prepareClip(clips.idle),
+    carryIdle: prepareClip(clips.carryIdle),
+    carryWalk: prepareClip(clips.carryWalk),
+    interact: prepareClip(clips.interact),
+  };
+}
+
 function validSelector(selector: unknown) {
   return selectorValues(selector).length > 0;
 }
@@ -547,6 +630,11 @@ function resolveBones(model: THREE.Object3D, manifest: RiggedAvatarManifest) {
   return result;
 }
 
+/** Rotation that maps an asset's authored forward vector onto Waitland's -Z. */
+export function riggedAvatarForwardCorrection(sourceForward: "-z" | "+z" | undefined) {
+  return sourceForward === "+z" ? Math.PI : 0;
+}
+
 function normalizeModel(model: THREE.Object3D, manifest: RiggedAvatarManifest) {
   model.updateMatrixWorld(true);
   const sourceBounds = new THREE.Box3().setFromObject(model, true);
@@ -583,7 +671,7 @@ function normalizeModel(model: THREE.Object3D, manifest: RiggedAvatarManifest) {
   const normalizedRoot = new THREE.Group();
   normalizedRoot.name = "rigged-avatar-normalization";
   normalizedRoot.scale.setScalar(scale);
-  if (normalization?.sourceForward === "+z") normalizedRoot.rotation.y = Math.PI;
+  normalizedRoot.rotation.y = riggedAvatarForwardCorrection(normalization?.sourceForward);
   normalizedRoot.add(content);
   return { normalizedRoot, normalizedHeight: sourceSize.y * scale };
 }
@@ -636,10 +724,12 @@ function instantiateRuntime(
     root.name = `rigged-avatar:${manifest.assetId}@${manifest.assetVersion}`;
     root.add(normalizedRoot);
 
+    const bones = resolveBones(cloned, manifest);
+    const runtimeClips = prepareRiggedAvatarClips(clips, manifest, bones.hips);
     const mixer = new THREE.AnimationMixer(cloned);
     const actions: Partial<Record<RiggedAvatarAnimationSlot, THREE.AnimationAction>> = {};
     for (const slot of ["idle", "walk", "carryIdle", "carryWalk", "interact"] as const) {
-      const clip = clips[slot];
+      const clip = runtimeClips[slot];
       if (!clip) continue;
       // A dedicated clip object prevents an accidental alias from changing a
       // looping locomotion action into LoopOnce.
@@ -654,7 +744,6 @@ function instantiateRuntime(
       actions[slot] = action;
     }
 
-    const bones = resolveBones(cloned, manifest);
     const headAnchor = new THREE.Group();
     headAnchor.name = "rigged-avatar-head-anchor";
     const heldItemAnchor = new THREE.Group();
@@ -881,7 +970,7 @@ function instantiateRuntime(
       root,
       model: cloned,
       mixer,
-      clips,
+      clips: runtimeClips,
       actions,
       materials: instanceMaterials,
       bones,
