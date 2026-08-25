@@ -52,3 +52,54 @@ async function verifyEndpoint({ url, validate }) {
 }
 
 for (const endpoint of endpoints) await verifyEndpoint(endpoint);
+
+async function verifyApplicationAssets() {
+  const pageUrl = "https://waitland.app/";
+  const response = await fetch(pageUrl, {
+    headers: { Accept: "text/html" },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Could not fetch ${pageUrl}: HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  const references = [...html.matchAll(/(?:href|src)=["']([^"']+)["']/g)]
+    .map((match) => new URL(match[1], pageUrl))
+    .filter(
+      (url) =>
+        url.origin === "https://waitland.app" &&
+        (url.pathname.startsWith("/assets/") ||
+          url.pathname.startsWith("/_next/static/")),
+    );
+  const assets = [...new Map(references.map((url) => [url.href, url])).values()];
+  const scripts = assets.filter((url) => /\.(?:m?js)$/i.test(url.pathname));
+  const styles = assets.filter((url) => /\.css$/i.test(url.pathname));
+  if (scripts.length === 0 || styles.length === 0) {
+    throw new Error("Homepage did not reference both JavaScript and CSS assets");
+  }
+
+  await Promise.all(
+    assets.map(async (url) => {
+      const assetResponse = await fetch(url, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!assetResponse.ok) {
+        throw new Error(`Could not fetch ${url.href}: HTTP ${assetResponse.status}`);
+      }
+      const contentType = assetResponse.headers.get("content-type") ?? "";
+      if (/\.css$/i.test(url.pathname) && !contentType.includes("text/css")) {
+        throw new Error(`${url.href} returned unexpected content type ${contentType}`);
+      }
+      if (
+        /\.(?:m?js)$/i.test(url.pathname) &&
+        !/(?:javascript|ecmascript)/i.test(contentType)
+      ) {
+        throw new Error(`${url.href} returned unexpected content type ${contentType}`);
+      }
+    }),
+  );
+  console.log(`verified ${assets.length} application assets from ${pageUrl}`);
+}
+
+await verifyApplicationAssets();

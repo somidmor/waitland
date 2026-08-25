@@ -69,3 +69,45 @@ test("responsive CSS includes phone, tablet, landscape, and safe-area contracts"
     assert.ok(compactCss.includes(contract), `compact phone override missing: ${contract}`);
   }
 });
+
+test("coarse-pointer landscape keeps chat between movement and action controls", () => {
+  const landscapeDevices = [
+    { name: "small landscape phone", width: 568, safeLeft: 0, safeRight: 0 },
+    { name: "iPhone SE landscape", width: 667, safeLeft: 0, safeRight: 0 },
+    { name: "iPhone 15 Pro landscape", width: 852, safeLeft: 59, safeRight: 59 },
+    { name: "Pixel 7 landscape", width: 915, safeLeft: 0, safeRight: 0 },
+  ];
+
+  for (const device of landscapeDevices) {
+    const joystickLeft = Math.max(20, device.safeLeft);
+    const joystickRight = joystickLeft + 90;
+    const actionRight = device.width - Math.max(18, device.safeRight);
+    const actionLeft = actionRight - 82;
+    const chatLeft = joystickLeft + 102;
+    const chatWidth = Math.min(
+      356,
+      device.width - joystickLeft - Math.max(18, device.safeRight) - 196,
+    );
+    const chatRight = chatLeft + chatWidth;
+
+    assert.ok(chatWidth >= 320, `${device.name}: chat target is too narrow`);
+    assert.ok(chatLeft - joystickRight >= 12, `${device.name}: chat overlaps joystick`);
+    assert.ok(actionLeft - chatRight >= 12, `${device.name}: chat overlaps action`);
+  }
+
+  const coarseLandscapeStart = css.indexOf(
+    "@media (orientation: landscape) and (max-height: 600px) and (pointer: coarse)",
+  );
+  const coarseLandscapeEnd = css.indexOf("@media", coarseLandscapeStart + 1);
+  const coarseLandscapeCss = css.slice(
+    coarseLandscapeStart,
+    coarseLandscapeEnd < 0 ? undefined : coarseLandscapeEnd,
+  );
+  for (const contract of [
+    "left: calc(max(20px, env(safe-area-inset-left)) + 102px)",
+    "max(18px, env(safe-area-inset-right)) - 196px",
+    "transform: none",
+  ]) {
+    assert.ok(coarseLandscapeCss.includes(contract), `landscape override missing: ${contract}`);
+  }
+});

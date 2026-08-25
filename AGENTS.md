@@ -46,8 +46,10 @@ when the application moved to native Cloudflare Workers.
   - `arrival-screen.tsx`: no-account arrival/profile flow.
   - `waiting-pit.tsx`: main game orchestration, input, HUD, and realtime event
     integration.
-  - `world-art.ts`: Three.js world, terrain, pit, stones, local avatar, motion,
+  - `world-art.ts`: Three.js terrain, pit, stones, environment dressing,
     shadows, and departure visuals.
+  - `avatar/`: versioned rigged-avatar manifest/runtime plus the procedural
+    local-avatar implementation and fallback.
   - `avatar-design.ts`: deterministic avatar parts and palette. Keep this as the
     stable customization boundary for a future character editor.
   - `remote-avatar-renderer.ts`: remote player visualization and interpolation.
@@ -232,15 +234,19 @@ Rules:
 
 ## Avatar and 3D asset boundary
 
-Current avatars are deterministic procedural Three.js characters. Future
-avatars may use rigged GLB models generated with Meshy or another modeling
-pipeline. Preserve these boundaries so customization does not require rewriting
-gameplay or transport:
+The local hero now prefers a versioned, rigged Meshy GLB with idle, walk, and
+pick/throw clips. It is lazy-loaded behind `avatar/waitlander-manifest.ts` and
+falls back to the deterministic procedural Three.js avatar if loading or WebGL
+support fails. Remote crowds remain lightweight instanced procedural avatars.
+Preserve these boundaries so customization does not require rewriting gameplay
+or transport:
 
 - Profile/avatar selection produces a stable avatar descriptor.
 - `avatar-design.ts` maps that descriptor to visual parts/material choices.
-- Local and remote renderers consume the same descriptor.
-- Today, both renderers derive a deterministic appearance from the actor ID;
+- Procedural local/fallback and remote renderers consume the same descriptor.
+- The rigged local renderer consumes a versioned asset manifest whose anchors
+  and clip aliases isolate gameplay from mesh-specific names.
+- Today, procedural appearances are derived deterministically from the actor ID;
   the protocol carries no appearance field. Future customization should add a
   compact descriptor or identifier, never raw models or textures.
 - Movement, collision, pickup, throw, chat, and departure state stay independent

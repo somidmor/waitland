@@ -16,9 +16,9 @@
     "load": "node scripts/realtime-harness.mjs --load"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "4.20260702.1",
+    "@cloudflare/workers-types": "5.20260825.1",
     "@types/node": "22.19.19",
     "typescript": "5.9.3",
-    "wrangler": "4.92.0"
+    "wrangler": "4.126.0"
   }
 }

@@ -175,6 +175,11 @@ export class RemoteAvatarRenderer {
   private readonly bunGeometry = new THREE.SphereGeometry(0.28, 10, 8);
   private readonly eyeGeometry = new THREE.SphereGeometry(0.038, 7, 5);
   private readonly glassesGeometry = new THREE.TorusGeometry(0.105, 0.018, 5, 12);
+  private readonly noseGeometry = new THREE.SphereGeometry(0.045, 7, 5);
+  private readonly mouthGeometry = new THREE.TorusGeometry(0.095, 0.011, 4, 10, Math.PI);
+  private readonly neckDetailGeometry = new THREE.TorusGeometry(0.32, 0.075, 7, 16);
+  private readonly pocketGeometry = new THREE.BoxGeometry(0.48, 0.25, 0.055);
+  private readonly bagGeometry = new THREE.BoxGeometry(0.38, 0.42, 0.16);
   private readonly shadowGeometry = new THREE.CircleGeometry(0.68, 18);
   private readonly stoneGeometry = new THREE.DodecahedronGeometry(0.34, 0);
   private readonly wingGeometry = makeWingGeometry();
@@ -187,6 +192,7 @@ export class RemoteAvatarRenderer {
   private readonly shoeMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.98, vertexColors: true });
   private readonly faceMaterial = new THREE.MeshBasicMaterial({ color: 0x2b211b });
   private readonly glassesMaterial = new THREE.MeshBasicMaterial({ color: 0x342d27 });
+  private readonly mouthMaterial = new THREE.MeshBasicMaterial({ color: 0x5b352b });
   private readonly shadowMaterial = new THREE.MeshBasicMaterial({ color: 0x302714, transparent: true, opacity: 0.17, depthWrite: false });
   private readonly stoneMaterial = new THREE.MeshStandardMaterial({ color: 0x8f887a, roughness: 0.98 });
   private readonly wingMaterial = new THREE.MeshStandardMaterial({ color: 0xfff9e9, emissive: 0x6b552b, emissiveIntensity: 0.08, roughness: 0.88, side: THREE.DoubleSide });
@@ -206,6 +212,14 @@ export class RemoteAvatarRenderer {
   private readonly rightEyes: THREE.InstancedMesh;
   private readonly leftGlasses: THREE.InstancedMesh;
   private readonly rightGlasses: THREE.InstancedMesh;
+  private readonly noses: THREE.InstancedMesh;
+  private readonly mouths: THREE.InstancedMesh;
+  private readonly topDetails: THREE.InstancedMesh;
+  private readonly pockets: THREE.InstancedMesh;
+  private readonly scarves: THREE.InstancedMesh;
+  private readonly bags: THREE.InstancedMesh;
+  private readonly leftLowerLegs: THREE.InstancedMesh;
+  private readonly rightLowerLegs: THREE.InstancedMesh;
   private readonly shadows: THREE.InstancedMesh;
   private readonly stones: THREE.InstancedMesh;
   private readonly leftWings: THREE.InstancedMesh;
@@ -258,6 +272,14 @@ export class RemoteAvatarRenderer {
     this.rightEyes = makeInstancedMesh(this.eyeGeometry, this.faceMaterial, this.capacity);
     this.leftGlasses = makeInstancedMesh(this.glassesGeometry, this.glassesMaterial, this.capacity);
     this.rightGlasses = makeInstancedMesh(this.glassesGeometry, this.glassesMaterial, this.capacity);
+    this.noses = makeInstancedMesh(this.noseGeometry, this.skinMaterial, this.capacity);
+    this.mouths = makeInstancedMesh(this.mouthGeometry, this.mouthMaterial, this.capacity);
+    this.topDetails = makeInstancedMesh(this.neckDetailGeometry, this.sweaterMaterial, this.capacity);
+    this.pockets = makeInstancedMesh(this.pocketGeometry, this.sweaterMaterial, this.capacity);
+    this.scarves = makeInstancedMesh(this.neckDetailGeometry, this.sweaterMaterial, this.capacity);
+    this.bags = makeInstancedMesh(this.bagGeometry, this.shoeMaterial, this.capacity);
+    this.leftLowerLegs = makeInstancedMesh(this.limbGeometry, this.skinMaterial, this.capacity);
+    this.rightLowerLegs = makeInstancedMesh(this.limbGeometry, this.skinMaterial, this.capacity);
     this.shadows = makeInstancedMesh(this.shadowGeometry, this.shadowMaterial, this.capacity);
     this.stones = makeInstancedMesh(this.stoneGeometry, this.stoneMaterial, this.capacity);
     this.leftWings = makeInstancedMesh(this.wingGeometry, this.wingMaterial, this.capacity);
@@ -282,6 +304,14 @@ export class RemoteAvatarRenderer {
       this.rightEyes,
       this.leftGlasses,
       this.rightGlasses,
+      this.noses,
+      this.mouths,
+      this.topDetails,
+      this.pockets,
+      this.scarves,
+      this.bags,
+      this.leftLowerLegs,
+      this.rightLowerLegs,
       this.stones,
       this.leftWings,
       this.rightWings,
@@ -499,9 +529,28 @@ export class RemoteAvatarRenderer {
 
       const swing = walking ? Math.sin(state.walkPhase) : 0;
       const bob = walking ? Math.abs(Math.sin(state.walkPhase)) * 0.048 : 0;
-      this.setPart(this.bodies, avatarCount, this.rootMatrix, 0, 1.42 + bob, 0, 0, 0, 0, 1, 1, 1);
+      const baseScale =
+        state.appearance.baseId === "compact-sturdy"
+          ? { bodyX: 1.08, bodyY: 0.94, head: 1.06 }
+          : state.appearance.baseId === "gentle-tall"
+            ? { bodyX: 0.94, bodyY: 1.08, head: 0.97 }
+            : { bodyX: 1, bodyY: 1, head: 1 };
+      this.setPart(
+        this.bodies,
+        avatarCount,
+        this.rootMatrix,
+        0,
+        1.42 + bob,
+        0,
+        0,
+        0,
+        0,
+        baseScale.bodyX,
+        baseScale.bodyY,
+        baseScale.bodyX,
+      );
       this.bodies.setColorAt(avatarCount, state.sweaterColor);
-      this.setPart(this.heads, avatarCount, this.rootMatrix, 0, 2.42 + bob, -0.02, 0, 0, 0, 1, 1.04, 0.98);
+      this.setPart(this.heads, avatarCount, this.rootMatrix, 0, 2.42 + bob, -0.02, 0, 0, 0, baseScale.head, baseScale.head * 1.04, baseScale.head * 0.98);
       this.heads.setColorAt(avatarCount, state.skinColor);
 
       const hair = hairStyleMetrics(state.appearance.hairStyle);
@@ -530,10 +579,20 @@ export class RemoteAvatarRenderer {
 
       const detailed = distanceSquared <= this.detailDistanceSquared;
       if (detailed) {
-        this.setPart(this.leftLegs, detailCount, this.rootMatrix, -0.22, 0.55, 0, swing * 0.5, 0, 0, 1.08, 1.08, 1.08);
-        this.setPart(this.rightLegs, detailCount, this.rootMatrix, 0.22, 0.55, 0, -swing * 0.5, 0, 0, 1.08, 1.08, 1.08);
+        const wearsShorts = state.appearance.bottomId === "walking-shorts";
+        const trouserY = wearsShorts ? 0.74 : 0.55;
+        const trouserScaleY = wearsShorts ? 0.54 : 1.08;
+        const trouserWidth = state.appearance.bottomId === "cuffed-trousers" ? 1.16 : 1.08;
+        this.setPart(this.leftLegs, detailCount, this.rootMatrix, -0.22, trouserY, 0, swing * 0.5, 0, 0, trouserWidth, trouserScaleY, trouserWidth);
+        this.setPart(this.rightLegs, detailCount, this.rootMatrix, 0.22, trouserY, 0, -swing * 0.5, 0, 0, trouserWidth, trouserScaleY, trouserWidth);
         this.leftLegs.setColorAt(detailCount, state.trouserColor);
         this.rightLegs.setColorAt(detailCount, state.trouserColor);
+
+        const lowerLegScale = wearsShorts ? 0.57 : 0.001;
+        this.setPart(this.leftLowerLegs, detailCount, this.rootMatrix, -0.22, 0.38, 0, swing * 0.5, 0, 0, 0.92, lowerLegScale, 0.92);
+        this.setPart(this.rightLowerLegs, detailCount, this.rootMatrix, 0.22, 0.38, 0, -swing * 0.5, 0, 0, 0.92, lowerLegScale, 0.92);
+        this.leftLowerLegs.setColorAt(detailCount, state.skinColor);
+        this.rightLowerLegs.setColorAt(detailCount, state.skinColor);
 
         const heldArm = pose.carryingStone ? -0.76 : swing * 0.34;
         this.setPart(this.leftArms, detailCount, this.rootMatrix, -0.57, 1.49 + bob, 0, -swing * 0.34, 0, 0.04, 0.94, 1, 0.94);
@@ -548,9 +607,30 @@ export class RemoteAvatarRenderer {
 
         this.setPart(this.leftEyes, detailCount, this.rootMatrix, -0.16, 2.48 + bob, -0.424, 0, 0, 0, 1, 0.72, 0.58);
         this.setPart(this.rightEyes, detailCount, this.rootMatrix, 0.16, 2.48 + bob, -0.424, 0, 0, 0, 1, 0.72, 0.58);
+        this.setPart(this.noses, detailCount, this.rootMatrix, 0, 2.39 + bob, -0.455, 0, 0, 0, 0.92, 0.76, 0.62);
+        this.noses.setColorAt(detailCount, state.skinColor);
+        this.setPart(this.mouths, detailCount, this.rootMatrix, 0, 2.28 + bob, -0.458, 0, 0, Math.PI, 0.9, 0.68, 0.7);
         const glassesScale = state.appearance.glasses ? 1 : 0.001;
         this.setPart(this.leftGlasses, detailCount, this.rootMatrix, -0.16, 2.48 + bob, -0.45, 0, 0, 0, glassesScale, glassesScale, glassesScale);
         this.setPart(this.rightGlasses, detailCount, this.rootMatrix, 0.16, 2.48 + bob, -0.45, 0, 0, 0, glassesScale, glassesScale, glassesScale);
+
+        const isHoodie = state.appearance.topId === "soft-hoodie";
+        const isCampShirt = state.appearance.topId === "camp-shirt";
+        const topDetailScale = isHoodie ? 1 : isCampShirt ? 0.72 : 0.001;
+        this.setPart(this.topDetails, detailCount, this.rootMatrix, 0, isHoodie ? 2.09 + bob : 1.86 + bob, isHoodie ? 0.16 : -0.39, isHoodie ? Math.PI / 2 : 0, 0, 0, topDetailScale, topDetailScale, topDetailScale);
+        this.topDetails.setColorAt(detailCount, state.sweaterColor);
+        const pocketScale = isHoodie ? 1 : 0.001;
+        this.setPart(this.pockets, detailCount, this.rootMatrix, 0, 1.28 + bob, -0.47, 0.08, 0, 0, pocketScale, pocketScale, pocketScale);
+        this.pockets.setColorAt(detailCount, state.sweaterColor);
+
+        const hasScarf = state.appearance.accessoryIds.includes("soft-scarf");
+        const scarfScale = hasScarf ? 1 : 0.001;
+        this.setPart(this.scarves, detailCount, this.rootMatrix, 0, 1.98 + bob, -0.08, Math.PI / 2, 0, 0, scarfScale, scarfScale * 0.72, scarfScale);
+        this.scarves.setColorAt(detailCount, state.sweaterColor);
+        const hasBag = state.appearance.accessoryIds.includes("crossbody-bag");
+        const bagScale = hasBag ? 1 : 0.001;
+        this.setPart(this.bags, detailCount, this.rootMatrix, 0.43, 1.12 + bob, -0.36, 0, 0.08, -0.08, bagScale, bagScale, bagScale);
+        this.bags.setColorAt(detailCount, state.shoeColor);
         detailCount += 1;
       }
 
@@ -621,6 +701,14 @@ export class RemoteAvatarRenderer {
     this.finishMesh(this.rightEyes, detailCount, false);
     this.finishMesh(this.leftGlasses, detailCount, false);
     this.finishMesh(this.rightGlasses, detailCount, false);
+    this.finishMesh(this.noses, detailCount, true);
+    this.finishMesh(this.mouths, detailCount, false);
+    this.finishMesh(this.topDetails, detailCount, true);
+    this.finishMesh(this.pockets, detailCount, true);
+    this.finishMesh(this.scarves, detailCount, true);
+    this.finishMesh(this.bags, detailCount, true);
+    this.finishMesh(this.leftLowerLegs, detailCount, true);
+    this.finishMesh(this.rightLowerLegs, detailCount, true);
     this.finishMesh(this.stones, stoneCount, false);
     this.finishMesh(this.leftWings, wingCount, false);
     this.finishMesh(this.rightWings, wingCount, false);
@@ -643,6 +731,11 @@ export class RemoteAvatarRenderer {
       this.bunGeometry,
       this.eyeGeometry,
       this.glassesGeometry,
+      this.noseGeometry,
+      this.mouthGeometry,
+      this.neckDetailGeometry,
+      this.pocketGeometry,
+      this.bagGeometry,
       this.shadowGeometry,
       this.stoneGeometry,
       this.wingGeometry,
@@ -656,6 +749,7 @@ export class RemoteAvatarRenderer {
       this.shoeMaterial,
       this.faceMaterial,
       this.glassesMaterial,
+      this.mouthMaterial,
       this.shadowMaterial,
       this.stoneMaterial,
       this.wingMaterial,

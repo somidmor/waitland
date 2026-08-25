@@ -28,7 +28,10 @@ import {
   type RemoteAvatarAnchor,
   type RemotePlayerSnapshot,
 } from "./remote-avatar-renderer";
-import { createAvatarAppearance, hairStyleMetrics } from "./avatar-design";
+import { createProceduralAvatar, type RiggedAvatarRuntime } from "./avatar";
+import { createAvatarAppearance } from "./avatar-design";
+import { WAITLANDER_RUNTIME_MANIFEST } from "./avatar/waitlander-manifest";
+import { CompassIcon, EditIcon, PeopleIcon, SendIcon, StoneIcon } from "./ui-icons";
 import { createStorybookWorld } from "./world-art";
 
 const CAPACITY = PIT_CAPACITY;
@@ -346,119 +349,45 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     player.rotation.y = 0;
     scene.add(player);
 
-    const bodyMaterial = new THREE.MeshStandardMaterial({ color: 0xf0d772, roughness: 0.96 });
-    const skinMaterial = new THREE.MeshStandardMaterial({ color: 0x9d6547, roughness: 0.95 });
-    const legMaterial = new THREE.MeshStandardMaterial({ color: 0x37443e, roughness: 0.98 });
-    const shoeMaterial = new THREE.MeshStandardMaterial({ color: 0x382a22, roughness: 0.98 });
-    const hairMaterial = new THREE.MeshStandardMaterial({ color: 0x35231a, roughness: 0.98 });
-    const faceMaterial = new THREE.MeshBasicMaterial({ color: 0x2b211b });
+    const localAvatar = createProceduralAvatar({
+      seed: `${profileRef.current.name}:${profileRef.current.city}`,
+      name: "local-player-avatar",
+      castShadow: true,
+      groundShadow: true,
+    });
+    player.add(localAvatar.root);
+    gameMount.dataset.avatarRenderer = "procedural";
 
-    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.48, 0.72, 6, 12), bodyMaterial);
-    body.position.y = 1.42;
-    body.castShadow = true;
-    player.add(body);
+    const riggedAvatarController = new AbortController();
+    let riggedAvatar: RiggedAvatarRuntime | null = null;
+    void (async () => {
+      try {
+        const { loadRiggedAvatar } = await import("./avatar/rigged-avatar-runtime.ts");
+        const result = await loadRiggedAvatar(WAITLANDER_RUNTIME_MANIFEST, {
+          signal: riggedAvatarController.signal,
+          initialMotion: { moving: false, speed: 0, carryingStone: false },
+          castShadow: true,
+          receiveShadow: false,
+        });
+        if (!result.ok) return;
+        if (disposed) {
+          result.avatar.dispose();
+          return;
+        }
+        riggedAvatar = result.avatar;
+        player.add(result.avatar.root);
+        localAvatar.root.visible = false;
+        gameMount.dataset.avatarRenderer = "rigged";
+      } catch {
+        // The procedural avatar is already visible and remains the complete
+        // offline/error fallback when the authored asset cannot be loaded.
+      }
+    })();
 
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.45, 18, 14), skinMaterial);
-    head.position.set(0, 2.42, -0.02);
-    head.castShadow = true;
-    player.add(head);
-
-    const hairCap = new THREE.Mesh(
-      new THREE.SphereGeometry(0.47, 16, 11, 0, Math.PI * 2, 0, Math.PI * 0.64),
-      hairMaterial,
-    );
-    hairCap.castShadow = true;
-    player.add(hairCap);
-    const hairBun = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 9), hairMaterial);
-    hairBun.castShadow = true;
-    player.add(hairBun);
-
-    const eyeGeometry = new THREE.SphereGeometry(0.038, 8, 6);
-    const leftEye = new THREE.Mesh(eyeGeometry, faceMaterial);
-    const rightEye = leftEye.clone();
-    leftEye.position.set(-0.16, 2.48, -0.424);
-    rightEye.position.set(0.16, 2.48, -0.424);
-    leftEye.scale.set(1, 0.72, 0.58);
-    rightEye.scale.copy(leftEye.scale);
-    player.add(leftEye, rightEye);
-
-    const glassesMaterial = new THREE.MeshBasicMaterial({ color: 0x342d27 });
-    const glassesGeometry = new THREE.TorusGeometry(0.105, 0.018, 5, 12);
-    const leftGlasses = new THREE.Mesh(glassesGeometry, glassesMaterial);
-    const rightGlasses = leftGlasses.clone();
-    leftGlasses.position.set(-0.16, 2.48, -0.45);
-    rightGlasses.position.set(0.16, 2.48, -0.45);
-    player.add(leftGlasses, rightGlasses);
-
-    const leftLeg = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.62, 4, 8), legMaterial);
-    const rightLeg = leftLeg.clone();
-    leftLeg.position.set(-0.2, 0.53, 0);
-    rightLeg.position.set(0.2, 0.53, 0);
-    leftLeg.castShadow = true;
-    rightLeg.castShadow = true;
-    player.add(leftLeg, rightLeg);
-
-    const leftArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.55, 4, 8), bodyMaterial);
-    const rightArm = leftArm.clone();
-    leftArm.position.set(-0.55, 1.44, 0);
-    rightArm.position.set(0.55, 1.44, 0);
-    leftArm.castShadow = true;
-    rightArm.castShadow = true;
-    player.add(leftArm, rightArm);
-
-    const leftShoe = new THREE.Mesh(new THREE.SphereGeometry(0.18, 10, 8), shoeMaterial);
-    const rightShoe = leftShoe.clone();
-    leftShoe.position.set(-0.2, 0.15, -0.08);
-    rightShoe.position.set(0.2, 0.15, -0.08);
-    leftShoe.scale.set(1.05, 0.72, 1.28);
-    rightShoe.scale.copy(leftShoe.scale);
-    leftShoe.castShadow = true;
-    rightShoe.castShadow = true;
-    player.add(leftShoe, rightShoe);
-
-    let hairCapBaseY = 2.61;
-    let hairBunBaseY = 2.84;
     function applyLocalAppearance(seed: string) {
-      const appearance = createAvatarAppearance(seed);
-      bodyMaterial.color.setHex(appearance.sweater);
-      skinMaterial.color.setHex(appearance.skin);
-      legMaterial.color.setHex(appearance.trousers);
-      shoeMaterial.color.setHex(appearance.shoes);
-      hairMaterial.color.setHex(appearance.hair);
-      const metrics = hairStyleMetrics(appearance.hairStyle);
-      hairCapBaseY = 2.51 + metrics.capOffsetY;
-      hairBunBaseY = metrics.bunY;
-      hairCap.position.set(0, hairCapBaseY, 0.03);
-      hairCap.scale.set(1.04, metrics.capY, metrics.capZ);
-      hairBun.position.set(0, hairBunBaseY, metrics.bunZ);
-      hairBun.scale.setScalar(Math.max(0.001, metrics.bunScale));
-      leftGlasses.visible = appearance.glasses;
-      rightGlasses.visible = appearance.glasses;
-    }
-    function applyLocalBob(bob: number) {
-      body.position.y = 1.42 + bob;
-      head.position.y = 2.42 + bob;
-      hairCap.position.y = hairCapBaseY + bob;
-      hairBun.position.y = hairBunBaseY + bob;
-      leftEye.position.y = 2.48 + bob;
-      rightEye.position.y = 2.48 + bob;
-      leftGlasses.position.y = 2.48 + bob;
-      rightGlasses.position.y = 2.48 + bob;
+      localAvatar.setAppearance(createAvatarAppearance(seed));
     }
     applyLocalAppearance(`${profileRef.current.name}:${profileRef.current.city}`);
-
-    const playerShadow = new THREE.Mesh(
-      new THREE.CircleGeometry(0.68, 24),
-      new THREE.MeshBasicMaterial({
-        color: 0x302714,
-        transparent: true,
-        opacity: 0.17,
-        depthWrite: false,
-      }),
-    );
-    playerShadow.rotation.x = -Math.PI / 2;
-    playerShadow.position.y = 0.018;
-    player.add(playerShadow);
 
     const keys = new Set<string>();
     let nearestRock: THREE.Mesh | null = null;
@@ -481,6 +410,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     const desiredCameraPosition = new THREE.Vector3();
     const cameraLookTarget = new THREE.Vector3();
     const speechAnchor = new THREE.Vector3();
+    const heldRockAnchorPosition = new THREE.Vector3();
     const remoteRenderer = new RemoteAvatarRenderer(scene, {
       maxPlayers: 64,
       interpolationDelayMs: 100,
@@ -1075,6 +1005,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       }
       heldRock = null;
       isThrowing = true;
+      riggedAvatar?.playInteraction({ restart: true });
       scene.attach(stone);
 
       const start = stone.position.clone();
@@ -1225,28 +1156,31 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         player.rotation.y += rotationDelta * Math.min(1, dt * 12);
 
         walkTime += dt * 10.5;
-        leftLeg.rotation.x = Math.sin(walkTime) * 0.52;
-        rightLeg.rotation.x = -Math.sin(walkTime) * 0.52;
-        leftArm.rotation.x = -Math.sin(walkTime) * 0.38;
-        if (!heldRock) rightArm.rotation.x = Math.sin(walkTime) * 0.38;
-        const localBob = Math.abs(Math.sin(walkTime)) * 0.048;
-        applyLocalBob(localBob);
-        leftShoe.position.z = -0.08 - Math.sin(walkTime) * 0.08;
-        rightShoe.position.z = -0.08 + Math.sin(walkTime) * 0.08;
+      }
+
+      const avatarMoving = inputLength > 0.08;
+      if (riggedAvatar) {
+        riggedAvatar.update(dt, {
+          moving: avatarMoving,
+          speed: avatarMoving ? 1 : 0,
+          carryingStone: Boolean(heldRock),
+        });
       } else {
-        leftLeg.rotation.x *= 0.82;
-        rightLeg.rotation.x *= 0.82;
-        leftArm.rotation.x *= 0.82;
-        if (!heldRock) rightArm.rotation.x *= 0.82;
-        const localBob = (body.position.y - 1.42) * 0.82;
-        applyLocalBob(localBob);
-        leftShoe.position.z += (-0.08 - leftShoe.position.z) * 0.18;
-        rightShoe.position.z += (-0.08 - rightShoe.position.z) * 0.18;
+        localAvatar.updatePose({
+          walkPhase: walkTime,
+          moving: avatarMoving,
+          speed: avatarMoving ? 1 : 0,
+          carryingStone: Boolean(heldRock),
+        });
       }
 
       if (heldRock) {
+        const heldItemAnchor = riggedAvatar?.anchors.heldItem ?? localAvatar.anchors.heldItem;
+        player.updateMatrixWorld(true);
+        heldItemAnchor.getWorldPosition(heldRockAnchorPosition);
+        player.worldToLocal(heldRockAnchorPosition);
+        heldRock.position.lerp(heldRockAnchorPosition, Math.min(1, dt * 18));
         heldRock.rotation.y += dt * 0.6;
-        rightArm.rotation.x += (-0.75 - rightArm.rotation.x) * 0.18;
       }
 
       const displacementX = player.position.x - positionBeforeX;
@@ -1366,6 +1300,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       respawnTimers.forEach((timer) => clearTimeout(timer));
       respawnTimers.clear();
       if (speechTimerRef.current) clearTimeout(speechTimerRef.current);
+      riggedAvatarController.abort();
       realtime.destroy();
       if (realtimeRef.current === realtime) realtimeRef.current = null;
       remoteRenderer.dispose();
@@ -1389,16 +1324,8 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       innerRimMaterial.dispose();
       rimClumpGeometry.dispose();
       rimClumpMaterial.dispose();
-      const localGeometries = new Set<THREE.BufferGeometry>();
-      const localMaterials = new Set<THREE.Material>();
-      player.traverse((child) => {
-        const mesh = child as THREE.Mesh;
-        if (mesh.geometry) localGeometries.add(mesh.geometry);
-        if (Array.isArray(mesh.material)) mesh.material.forEach((material) => localMaterials.add(material));
-        else if (mesh.material) localMaterials.add(mesh.material);
-      });
-      localGeometries.forEach((geometry) => geometry.dispose());
-      localMaterials.forEach((material) => material.dispose());
+      riggedAvatar?.dispose();
+      localAvatar.dispose();
       if (renderer?.domElement.parentElement === mount) mount.removeChild(renderer.domElement);
       worldFallback?.remove();
     };
@@ -1506,6 +1433,9 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
                 <span>{profile.city}</span>
               </span>
             </span>
+            <span className="profile-edit-icon" aria-hidden="true">
+              <EditIcon />
+            </span>
           </button>
 
           <div className="counter-card">
@@ -1520,7 +1450,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         </div>
 
         <div className={`network-presence is-${connectionState}`} aria-live="polite">
-          <span className="people-icon" aria-hidden="true"><i /><i /></span>
+          <PeopleIcon className="people-icon" />
           <span title={connectionStatus.reason}>
             {networkLabel(connectionStatus, onlineCount)}
           </span>
@@ -1533,7 +1463,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       </div>
 
       <div className="pit-direction" aria-label={`The pit is ${distanceToPit} metres away`}>
-        <span className="pit-arrow" aria-hidden="true">○</span>
+        <CompassIcon className="pit-arrow" />
         <span>{distanceToPit}m to pit</span>
       </div>
 
@@ -1554,7 +1484,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           disabled={!chatText.trim() || chatUnavailable}
           aria-label="Send message"
         >
-          ➤
+          <SendIcon />
         </button>
       </form>
 
@@ -1605,9 +1535,12 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           }
         >
           <span className="action-icon" aria-hidden="true">
-            {actionMode === "throw" ? "↗" : "◆"}
+            <span className="action-stone">
+              <StoneIcon />
+            </span>
+            {actionMode === "throw" ? <span className="throw-mark">↗</span> : null}
           </span>
-          <span>
+          <span className="action-label">
             {actionMode === "pickup" ? "Pick up" : actionMode === "throw" ? "Throw" : "Find one"}
           </span>
         </button>
