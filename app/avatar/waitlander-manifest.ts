@@ -1,8 +1,9 @@
 import type { RiggedAvatarManifest } from "./rigged-avatar-runtime.ts";
 
 /**
- * Versioned production hero asset. Remote crowds continue to use instanced LOD
- * geometry, while this model gives the local player the authored Meshy rig.
+ * Versioned production humanoid asset. The local hero and bounded nearby
+ * remotes share this decoded template; distant/overflow crowds use instanced
+ * procedural LOD geometry.
  */
 export const WAITLANDER_RUNTIME_MANIFEST = {
   schemaVersion: 1,

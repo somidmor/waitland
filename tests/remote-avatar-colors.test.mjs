@@ -9,6 +9,7 @@ test("remote avatar instance tints are not multiplied by missing vertex colors",
     interpolationDelayMs: 0,
     maxRenderDistance: 20,
     detailDistance: 20,
+    maxRiggedPlayers: 0,
   });
   renderer.upsert({
     id: "remote-color-check",

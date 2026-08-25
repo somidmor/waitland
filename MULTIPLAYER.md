@@ -74,9 +74,10 @@ movement is never sent through a global object.
 - The client sends at most 8 movement updates per second. The server admits a
   sustained maximum of 10 per second per actor: 64 active players produce at
   most 512 expected movement messages per second in a well-behaved full room.
-- The room validates sequence numbers, speed, elapsed server time, field
-  bounds, and pit collision. Client-reported velocity and clocks are not
-  authoritative.
+- The room validates sequence numbers, speed, elapsed server time, precisely
+  representable finite coordinates, and pit collision. The visual terrain is
+  streamed without an outer boundary; client-reported velocity and clocks are
+  not authoritative.
 - Dirty player updates are coalesced into one delta frame every 80 ms, or at
   most 12.5 room frames per second, then broadcast to that room's sockets for
   client interpolation.

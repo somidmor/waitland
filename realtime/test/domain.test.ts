@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PIT_WALL_RADIUS, WALK_SPEED } from "../../shared/world.ts";
+import {
+  FIELD_STONE_COUNT,
+  NEAR_PIT_STONE_POOL_COUNT,
+  PIT_WALL_RADIUS,
+  STONE_THROW_DISTANCE,
+  WALK_SPEED,
+  clampPositionOutsidePit,
+  getForwardStonePosition,
+  getNextNearbyStoneGeneration,
+  getStoneDescriptor,
+  isNearPitStonePosition,
+} from "../../shared/world.ts";
 import {
   CHAT_MAX_CHARACTERS,
   TokenBucket,
@@ -89,6 +100,66 @@ test("movement cannot cross into the pit", () => {
   assert.ok(Math.hypot(accepted.x, accepted.z) >= PIT_WALL_RADIUS - 0.001);
 });
 
+test("movement has no practical outer map boundary but still rejects unsafe numbers", () => {
+  const current = player({ x: 10_000, z: -10_000, lastSeq: 8 });
+  const accepted = validateMovement(
+    current,
+    { t: "move", seq: 9, x: 10_001, z: -10_000, heading: 0 },
+    2_000,
+  );
+  assert.ok(accepted);
+  assert.ok(accepted.x > 10_000);
+  assert.ok(accepted.z <= -10_000);
+  assert.equal(
+    validateMovement(current, { t: "move", seq: 9, x: Number.POSITIVE_INFINITY, z: 0 }, 2_000),
+    null,
+  );
+  assert.equal(
+    validateMovement(current, { t: "move", seq: 9, x: Number.MAX_VALUE, z: 0 }, 2_000),
+    null,
+  );
+});
+
+test("the pit clamp does not impose the former field edge", () => {
+  assert.deepEqual(clampPositionOutsidePit(10_000, -10_000), { x: 10_000, z: -10_000 });
+  const center = clampPositionOutsidePit(0, 0);
+  assert.ok(Math.hypot(center.x, center.z) >= PIT_WALL_RADIUS);
+});
+
+test("a non-deposited throw lands a shared fixed distance from its action-time pose", () => {
+  const landing = getForwardStonePosition(40, 40, 0);
+  assert.equal(landing.x, 40);
+  assert.equal(landing.z, 40 - STONE_THROW_DISTANCE);
+  assert.equal(Math.hypot(landing.x - 40, landing.z - 40), STONE_THROW_DISTANCE);
+});
+
+test("every deterministic generation reserves enough stones near the pit", () => {
+  for (let generation = 0; generation < 8; generation += 1) {
+    let nearby = 0;
+    for (let index = 0; index < FIELD_STONE_COUNT; index += 1) {
+      const descriptor = getStoneDescriptor(index, generation);
+      if (isNearPitStonePosition(descriptor.x, descriptor.z)) nearby += 1;
+    }
+    assert.equal(nearby, NEAR_PIT_STONE_POOL_COUNT);
+    assert.ok(nearby >= 10);
+  }
+});
+
+test("any unheld stone can be deterministically recycled into the near-pit reserve", () => {
+  const farIndex = FIELD_STONE_COUNT - 1;
+  const initial = getStoneDescriptor(farIndex, 0);
+  assert.equal(isNearPitStonePosition(initial.x, initial.z), false);
+
+  const recycledGeneration = getNextNearbyStoneGeneration(initial.generation);
+  const recycled = getStoneDescriptor(farIndex, recycledGeneration);
+  assert.equal(isNearPitStonePosition(recycled.x, recycled.z), true);
+  assert.equal(recycled.generation, recycledGeneration);
+
+  const afterDeposit = getStoneDescriptor(farIndex, recycled.generation + 1);
+  assert.equal(isNearPitStonePosition(afterDeposit.x, afterDeposit.z), true);
+  assert.ok(afterDeposit.generation > recycled.generation);
+});
+
 test("an explicit zero-velocity edge persists a stationary final pose", () => {
   const accepted = validateMovement(
     player(),
@@ -107,6 +178,13 @@ test("spawn placement selects the nearest non-stacked safe slot", () => {
   ];
   const placement = findNonStackedPosition(12, 12, occupied);
   for (const other of occupied) assert.ok(Math.hypot(placement.x - other.x, placement.z - other.z) > 1.3);
+});
+
+test("spawn placement preserves a valid location far beyond the visual landmark", () => {
+  assert.deepEqual(findNonStackedPosition(10_000, -10_000, []), {
+    x: 10_000,
+    z: -10_000,
+  });
 });
 
 test("token bucket permits a burst and then refills", () => {

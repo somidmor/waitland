@@ -17,9 +17,9 @@ test("portrait HUD keeps the progress, chat, movement, and action regions separa
     const edge = compact ? 15 : 21;
     const gap = compact ? 12 : 14;
     const hudWidth = compact
-      ? Math.min(225, device.width * 0.57)
+      ? Math.min(190, device.width * 0.44)
       : Math.min(272, device.width * 0.69);
-    const presenceWidth = compact ? 100 : 118;
+    const presenceWidth = compact ? 92 : 118;
     assert.ok(
       edge * 2 + hudWidth + gap + presenceWidth <= device.width,
       `${device.name}: top HUD regions overlap`,
@@ -27,9 +27,9 @@ test("portrait HUD keeps the progress, chat, movement, and action regions separa
 
     if (device.width < 600) {
       const chatLeft = 14;
-      const chatWidth = device.width - 138;
+      const chatWidth = device.width - 158;
       const actionLeft = device.width - 12 - 92;
-      assert.ok(chatWidth >= 220, `${device.name}: chat target is too narrow`);
+      assert.ok(chatWidth >= 210, `${device.name}: chat target is too narrow`);
       assert.ok(actionLeft - (chatLeft + chatWidth) >= 12, `${device.name}: chat overlaps action`);
 
       const joystickBottom = Math.max(17, device.safeBottom) + 103;
@@ -61,9 +61,9 @@ test("responsive CSS includes phone, tablet, landscape, and safe-area contracts"
   const compactEnd = css.indexOf("@media", compactStart + 1);
   const compactCss = css.slice(compactStart, compactEnd < 0 ? undefined : compactEnd);
   for (const contract of [
-    "width: min(225px, 57vw)",
-    "max-width: 100px",
-    "width: calc(100vw - 138px)",
+    "width: min(190px, 44vw)",
+    "max-width: 92px",
+    "width: calc(100vw - 158px)",
     "width: 92px",
   ]) {
     assert.ok(compactCss.includes(contract), `compact phone override missing: ${contract}`);

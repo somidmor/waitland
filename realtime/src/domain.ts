@@ -1,6 +1,5 @@
 import {
   CARRY_SPEED,
-  FIELD_RADIUS,
   PIT_WALL_RADIUS,
   WALK_SPEED,
   clampPositionOutsidePit,
@@ -18,6 +17,17 @@ export const PLAYER_RADIUS = 0.62;
 export const SLEEP_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const MOVEMENT_CREDIT_WINDOW_SECONDS = 0.35;
 const MOVEMENT_CREDIT_TOLERANCE_METERS = 0.12;
+const POSITION_PRECISION = 1_000;
+const MAX_PRECISE_WORLD_COORDINATE = Number.MAX_SAFE_INTEGER / POSITION_PRECISION;
+const SPAWN_SEARCH_LIMIT = 512;
+
+function isSafeWorldCoordinate(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Math.abs(value) <= MAX_PRECISE_WORLD_COORDINATE
+  );
+}
 
 function text(value: unknown, fallback: string, maxCharacters: number) {
   if (typeof value !== "string") return fallback;
@@ -103,13 +113,14 @@ export function replenishedMovementCredit(player: StoredPlayer, now: number) {
  */
 export function validateMovement(player: StoredPlayer, message: MoveMessage, now: number): MovementResult | null {
   if (!Number.isSafeInteger(message.seq) || message.seq <= player.lastSeq) return null;
-  if (!Number.isFinite(message.x) || !Number.isFinite(message.z)) return null;
+  if (!isSafeWorldCoordinate(message.x) || !isSafeWorldCoordinate(message.z)) return null;
 
   const speed = player.carrying ? CARRY_SPEED : WALK_SPEED;
   const replenishedCredit = replenishedMovementCredit(player, now);
   const deltaX = message.x - player.x;
   const deltaZ = message.z - player.z;
   const distance = Math.hypot(deltaX, deltaZ);
+  if (!Number.isFinite(distance)) return null;
   const acceptedDistance = Math.min(distance, replenishedCredit);
   const scale = distance > acceptedDistance ? acceptedDistance / distance : 1;
   const boundedX = player.x + deltaX * scale;
@@ -170,19 +181,24 @@ export function findNonStackedPosition(
   desiredZ: number,
   occupied: Array<{ x: number; z: number }>,
 ) {
-  const safe = clampPositionOutsidePit(desiredX, desiredZ);
+  const safe = clampPositionOutsidePit(
+    isSafeWorldCoordinate(desiredX) ? desiredX : 0,
+    isSafeWorldCoordinate(desiredZ) ? desiredZ : 18,
+  );
   const minimumDistance = PLAYER_RADIUS * 2.15;
   const buckets = new Map<string, Array<{ x: number; z: number }>>();
   const cell = (value: number) => Math.floor(value / minimumDistance);
   for (const position of occupied) {
+    if (!isSafeWorldCoordinate(position.x) || !isSafeWorldCoordinate(position.z)) continue;
     const key = `${cell(position.x)}:${cell(position.z)}`;
     const bucket = buckets.get(key);
     if (bucket) bucket.push(position);
     else buckets.set(key, [position]);
   }
   const isFree = (x: number, z: number) => {
+    if (!isSafeWorldCoordinate(x) || !isSafeWorldCoordinate(z)) return false;
     const radius = Math.hypot(x, z);
-    if (radius < PIT_WALL_RADIUS + PLAYER_RADIUS || radius > FIELD_RADIUS - PLAYER_RADIUS) return false;
+    if (radius < PIT_WALL_RADIUS + PLAYER_RADIUS) return false;
     const cellX = cell(x);
     const cellZ = cell(z);
     for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
@@ -198,7 +214,7 @@ export function findNonStackedPosition(
   if (isFree(safe.x, safe.z)) return { x: roundPosition(safe.x), z: roundPosition(safe.z) };
 
   const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-  for (let index = 1; index <= 180; index += 1) {
+  for (let index = 1; index <= SPAWN_SEARCH_LIMIT; index += 1) {
     const radius = minimumDistance * Math.sqrt(index);
     const angle = goldenAngle * index;
     const candidate = clampPositionOutsidePit(
@@ -210,20 +226,14 @@ export function findNonStackedPosition(
     }
   }
 
-  // A bounded grid scan is the no-stack fallback for unusually dense clusters.
-  const fieldEdge = FIELD_RADIUS - PLAYER_RADIUS;
-  for (let z = -fieldEdge; z <= fieldEdge; z += minimumDistance) {
-    for (let x = -fieldEdge; x <= fieldEdge; x += minimumDistance) {
-      if (isFree(x, z)) return { x: roundPosition(x), z: roundPosition(z) };
-    }
-  }
-
-  // The hard sleeper ceiling is well below geometric saturation. This final
-  // branch is defensive for corrupted legacy state only.
+  // Search cost stays fixed even if storage is corrupted. In an unbounded
+  // world this deterministic fallback can simply move beyond the searched
+  // cluster instead of scanning a finite map grid.
   const fallbackAngle = occupied.length * goldenAngle;
+  const fallbackRadius = minimumDistance * (SPAWN_SEARCH_LIMIT + occupied.length + 1);
   return {
-    x: roundPosition(Math.cos(fallbackAngle) * (FIELD_RADIUS - PLAYER_RADIUS)),
-    z: roundPosition(Math.sin(fallbackAngle) * (FIELD_RADIUS - PLAYER_RADIUS)),
+    x: roundPosition(safe.x + Math.cos(fallbackAngle) * fallbackRadius),
+    z: roundPosition(safe.z + Math.sin(fallbackAngle) * fallbackRadius),
   };
 }
 

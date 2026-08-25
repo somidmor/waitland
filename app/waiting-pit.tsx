@@ -4,10 +4,13 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import * as THREE from "three";
 import {
   CARRY_SPEED,
+  clampPositionOutsidePit,
   FIELD_RADIUS,
   FIELD_STONE_COUNT,
+  getForwardStonePosition,
   getStoneDescriptor,
   PIT_CAPACITY,
+  PIT_RADIUS,
   PIT_THROW_RADIUS,
   PIT_WALL_RADIUS,
   WALK_SPEED,
@@ -31,7 +34,12 @@ import {
 import { createProceduralAvatar, type RiggedAvatarRuntime } from "./avatar";
 import { createAvatarAppearance } from "./avatar-design";
 import { WAITLANDER_RUNTIME_MANIFEST } from "./avatar/waitlander-manifest";
-import { CompassIcon, EditIcon, PeopleIcon, SendIcon, StoneIcon } from "./ui-icons";
+import {
+  createPitFloorGeometry,
+  createPitLipGeometry,
+  createPitWallGeometry,
+} from "./pit-geometry";
+import { CompassIcon, PeopleIcon, SendIcon, StoneIcon } from "./ui-icons";
 import {
   attachEnvironmentMaterialTextures,
   createStorybookWorld,
@@ -39,14 +47,24 @@ import {
 } from "./world-art";
 
 const CAPACITY = PIT_CAPACITY;
-const PIT_RADIUS = 4.6;
 const STORAGE_KEY = "waiting-pit-stones-v1";
 const REMOTE_SPEECH_TTL_MS = 7_000;
+const STONE_RENDER_DISTANCE_SQUARED = 25 * 25;
 
 type ActionMode = "none" | "pickup" | "throw";
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function randomPitLanding() {
+  const angle = Math.random() * Math.PI * 2;
+  const radius = Math.sqrt(Math.random()) * (PIT_RADIUS - 0.48);
+  return new THREE.Vector3(
+    Math.cos(angle) * radius,
+    -0.56,
+    Math.sin(angle) * radius,
+  );
 }
 
 function readStoredStoneCount() {
@@ -155,7 +173,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
 
     const scene = new THREE.Scene();
     scene.background = null;
-    scene.fog = new THREE.Fog(0xe8bb78, 42, 118);
+    scene.fog = new THREE.Fog(0xe8bb78, 58, 138);
 
     const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 160);
     camera.position.set(0, 12, 36);
@@ -170,7 +188,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.12;
+      renderer.toneMappingExposure = 1.02;
       renderer.domElement.className = "world-canvas";
       renderer.domElement.setAttribute(
         "aria-label",
@@ -188,8 +206,8 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       mount.appendChild(worldFallback);
     }
 
-    scene.add(new THREE.HemisphereLight(0xffe8bd, 0x535637, 2.35));
-    const sun = new THREE.DirectionalLight(0xffd89a, 3.65);
+    scene.add(new THREE.HemisphereLight(0xffe8c8, 0x39452d, 1.72));
+    const sun = new THREE.DirectionalLight(0xffdfad, 2.85);
     sun.position.set(-24, 31, 18);
     sun.castShadow = true;
     sun.shadow.mapSize.set(1024, 1024);
@@ -205,94 +223,67 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     scene.add(pitGroup);
 
     const pitFloorMaterial = new THREE.MeshStandardMaterial({
-      color: 0x6b5136,
+      color: 0x493a31,
       roughness: 1,
       metalness: 0,
     });
-    const pitFloor = new THREE.Mesh(
-      new THREE.CircleGeometry(PIT_RADIUS + 0.04, 64),
-      pitFloorMaterial,
-    );
-    pitFloor.rotation.x = -Math.PI / 2;
-    pitFloor.position.y = -0.34;
+    const pitFloorGeometry = createPitFloorGeometry();
+    const pitFloor = new THREE.Mesh(pitFloorGeometry, pitFloorMaterial);
     pitFloor.receiveShadow = true;
     pitGroup.add(pitFloor);
 
-    const pitRimMaterial = new THREE.MeshStandardMaterial({
-      color: 0x977149,
-      roughness: 1,
-      metalness: 0,
-    });
-    const pitWallGeometry = new THREE.CylinderGeometry(
-      5.02,
-      PIT_RADIUS + 0.04,
-      0.72,
-      64,
-      1,
-      true,
-    );
     const pitWallMaterial = new THREE.MeshStandardMaterial({
-      color: 0x745238,
+      color: 0x654735,
       roughness: 1,
       metalness: 0,
-      // Cylinder normals face away from the excavation. Render the inward
-      // surface so the wall remains visible from the gameplay camera.
-      side: THREE.BackSide,
+      side: THREE.DoubleSide,
     });
+    const pitWallGeometry = createPitWallGeometry();
     const pitWall = new THREE.Mesh(pitWallGeometry, pitWallMaterial);
-    pitWall.position.y = 0.02;
+    pitWall.castShadow = true;
     pitWall.receiveShadow = true;
     pitGroup.add(pitWall);
 
-    const pitRim = new THREE.Mesh(new THREE.TorusGeometry(5.14, 0.74, 10, 64), pitRimMaterial);
-    pitRim.rotation.x = Math.PI / 2;
-    pitRim.position.y = 0.28;
-    pitRim.castShadow = true;
-    pitRim.receiveShadow = true;
-    pitGroup.add(pitRim);
-
-    const innerRimMaterial = new THREE.MeshBasicMaterial({
-      color: 0xd0a96f,
-      transparent: true,
-      opacity: 0.46,
-    });
-    const innerRim = new THREE.Mesh(new THREE.TorusGeometry(4.48, 0.1, 7, 64), innerRimMaterial);
-    innerRim.rotation.x = Math.PI / 2;
-    innerRim.position.y = 0.47;
-    pitGroup.add(innerRim);
-
-    const rimClumpGeometry = new THREE.DodecahedronGeometry(0.72, 0);
-    const rimClumpMaterial = new THREE.MeshStandardMaterial({
-      color: 0xa17b4f,
+    const pitLipMaterial = new THREE.MeshStandardMaterial({
+      color: 0x8e6845,
       roughness: 1,
       metalness: 0,
     });
-    const rimClumps = new THREE.InstancedMesh(rimClumpGeometry, rimClumpMaterial, 30);
-    const rimClumpTransform = new THREE.Object3D();
-    for (let index = 0; index < rimClumps.count; index += 1) {
-      const angle = (index / rimClumps.count) * Math.PI * 2;
-      const wave = Math.sin(index * 4.71) * 0.18;
-      rimClumpTransform.position.set(
-        Math.cos(angle) * (5.23 + wave),
-        0.28 + Math.sin(index * 1.83) * 0.08,
-        Math.sin(angle) * (5.23 + wave),
+    const pitLipGeometry = createPitLipGeometry();
+    const pitLip = new THREE.Mesh(pitLipGeometry, pitLipMaterial);
+    pitLip.castShadow = true;
+    pitLip.receiveShadow = true;
+    pitGroup.add(pitLip);
+
+    const pitClodGeometry = new THREE.DodecahedronGeometry(0.4, 0);
+    const pitClods = new THREE.InstancedMesh(pitClodGeometry, pitLipMaterial, 8);
+    const pitClodTransform = new THREE.Object3D();
+    for (let index = 0; index < pitClods.count; index += 1) {
+      const angle = (index / pitClods.count) * Math.PI * 2 + Math.sin(index * 2.3) * 0.08;
+      const radius = PIT_RADIUS + 0.46 + Math.sin(index * 4.17) * 0.2;
+      pitClodTransform.position.set(
+        Math.cos(angle) * radius * 1.035,
+        -0.015 + (index % 3) * 0.018,
+        Math.sin(angle) * radius,
       );
-      rimClumpTransform.rotation.set(index * 0.31, -angle, index * 0.17);
-      rimClumpTransform.scale.set(0.82 + (index % 3) * 0.12, 0.52 + (index % 4) * 0.07, 1.12);
-      rimClumpTransform.updateMatrix();
-      rimClumps.setMatrixAt(index, rimClumpTransform.matrix);
+      pitClodTransform.rotation.set(index * 0.37, -angle, index * 0.21);
+      pitClodTransform.scale.set(
+        0.72 + (index % 4) * 0.09,
+        0.12 + (index % 3) * 0.035,
+        0.86 + (index % 5) * 0.07,
+      );
+      pitClodTransform.updateMatrix();
+      pitClods.setMatrixAt(index, pitClodTransform.matrix);
     }
-    rimClumps.instanceMatrix.needsUpdate = true;
-    rimClumps.receiveShadow = true;
-    rimClumps.castShadow = false;
-    pitGroup.add(rimClumps);
+    pitClods.instanceMatrix.needsUpdate = true;
+    pitClods.receiveShadow = true;
+    pitGroup.add(pitClods);
 
     const pitTextureBinding = attachEnvironmentMaterialTextures(
       [
-        { material: pitFloorMaterial, texturedColor: 0x8a755c },
-        { material: pitWallMaterial, texturedColor: 0x92704f },
-        { material: pitRimMaterial, texturedColor: 0xc7a475 },
-        { material: rimClumpMaterial, texturedColor: 0xb99668 },
+        { material: pitFloorMaterial, texturedColor: 0x5d5044 },
+        { material: pitWallMaterial, texturedColor: 0x765c49 },
+        { material: pitLipMaterial, texturedColor: 0xa98d6d },
       ],
       ENVIRONMENT_TEXTURE_PATHS.pit,
       { repeat: 3, normalScale: 0.38 },
@@ -305,6 +296,30 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       new THREE.MeshStandardMaterial({ color: 0xa0927e, roughness: 0.95 }),
       new THREE.MeshStandardMaterial({ color: 0x676b69, roughness: 0.98 }),
     ];
+
+    const embeddedGravel = new THREE.InstancedMesh(
+      stoneGeometry,
+      stoneMaterials[2],
+      18,
+    );
+    const gravelTransform = new THREE.Object3D();
+    for (let index = 0; index < embeddedGravel.count; index += 1) {
+      const angle = index * 2.399963229728653;
+      const radius = 0.64 + ((index * 37) % 100) / 100 * (PIT_RADIUS - 1.02);
+      const scale = 0.19 + ((index * 19) % 8) * 0.018;
+      gravelTransform.position.set(
+        Math.cos(angle) * radius,
+        -0.72 + (index % 3) * 0.018,
+        Math.sin(angle) * radius,
+      );
+      gravelTransform.rotation.set(angle * 0.31, angle, angle * 0.17);
+      gravelTransform.scale.set(scale * 1.2, scale * 0.62, scale);
+      gravelTransform.updateMatrix();
+      embeddedGravel.setMatrixAt(index, gravelTransform.matrix);
+    }
+    embeddedGravel.instanceMatrix.needsUpdate = true;
+    embeddedGravel.receiveShadow = true;
+    pitGroup.add(embeddedGravel);
 
     function shapeStone(stone: THREE.Mesh, index: number, generation = 0) {
       const descriptor = getStoneDescriptor(index, generation);
@@ -360,12 +375,13 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         const descriptor = getStoneDescriptor(i % FIELD_STONE_COUNT, generation);
         const normalized = i / Math.max(1, visibleCount);
         const radius =
-          Math.sqrt(Math.abs(descriptor.x) / FIELD_RADIUS) * (3.9 - normalized * 0.35);
+          Math.sqrt(Math.abs(descriptor.x) / FIELD_RADIUS) *
+          (PIT_RADIUS - 0.46 - normalized * 0.24);
         const angle = descriptor.rotationY * Math.PI;
         const lift = Math.max(0, (nextCount / CAPACITY) * 2.25 - radius * 0.18);
         pitPileTransform.position.set(
           Math.cos(angle) * radius,
-          -0.1 + lift,
+          -0.57 + lift,
           Math.sin(angle) * radius,
         );
         pitPileTransform.rotation.set(
@@ -454,10 +470,11 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           elapsed: number;
           duration: number;
           landsInPit: boolean;
+          forwardEnd: THREE.Vector3;
+          awaitingAuthority: boolean;
         }
       | undefined;
 
-    const worldForward = new THREE.Vector3(0, 0, -1);
     const worldUp = new THREE.Vector3(0, 1, 0);
     const cameraForward = new THREE.Vector3(0, 0, -1);
     const cameraRight = new THREE.Vector3(1, 0, 0);
@@ -591,11 +608,11 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
 
       const remoteProfile = anchor.profile;
       const remoteFlag = countryCodeToFlag(remoteProfile?.countryCode ?? "");
-      const nextName = `${remoteFlag} ${remoteProfile?.name ?? "Someone"}`;
       const city = remoteProfile?.city?.trim();
+      const nextName = `${remoteProfile?.name ?? "Someone"}${city ? ` · ${city}` : ""}${remoteFlag ? ` ${remoteFlag}` : ""}`;
       const nextDetail = anchor.departing
         ? "Heading back to real life"
-        : `${city ? `${city} · ` : ""}Waiting for ${remoteProfile?.waitingFor ?? "something"}`;
+        : `Waiting for ${remoteProfile?.waitingFor ?? "something"}`;
       if (overlay.name.textContent !== nextName) overlay.name.textContent = nextName;
       if (overlay.detail.textContent !== nextDetail) overlay.detail.textContent = nextDetail;
       const speechIsLive =
@@ -785,30 +802,34 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       if (typeof result.count === "number") applyPitCount(result.count);
       if (
         pending?.kind === "throw" &&
-        result.ok &&
-        result.deposited === false &&
+        (result.ok || result.reason === "pit-unavailable") &&
         activeThrow?.stone === pending.stone
       ) {
-        activeThrow.landsInPit = false;
-        const forward = worldForward.clone().applyQuaternion(player.quaternion).normalize();
-        activeThrow.end.set(
-          player.position.x + forward.x * 7.5,
-          0.3,
-          player.position.z + forward.z * 7.5,
-        );
-      }
-      if (
-        pending?.kind === "throw" &&
-        result.ok &&
-        result.deposited === true &&
-        activeThrow?.stone === pending.stone
-      ) {
-        activeThrow.landsInPit = true;
-        activeThrow.end.set(
-          (Math.random() - 0.5) * 4.4,
-          0.34,
-          (Math.random() - 0.5) * 4.4,
-        );
+        const throwAnimation = activeThrow;
+        const animationHadFinished = throwAnimation.elapsed >= throwAnimation.duration;
+        const priorEnd = throwAnimation.end.clone();
+        if (result.deposited === true) {
+          throwAnimation.landsInPit = true;
+          throwAnimation.end.copy(randomPitLanding());
+        } else {
+          throwAnimation.landsInPit = false;
+          const authoritative = deferredStoneStates.get(
+            String(pending.stone.userData.stoneId ?? ""),
+          );
+          throwAnimation.end.copy(
+            authoritative && !authoritative.holderId
+              ? new THREE.Vector3(authoritative.x, 0.3, authoritative.z)
+              : throwAnimation.forwardEnd,
+          );
+        }
+        throwAnimation.awaitingAuthority = false;
+        // If durable persistence delayed the acknowledgement beyond the first
+        // arc, animate a short correction instead of teleporting to its target.
+        if (animationHadFinished && priorEnd.distanceTo(throwAnimation.end) > 0.05) {
+          throwAnimation.start.copy(throwAnimation.stone.position);
+          throwAnimation.elapsed = 0;
+          throwAnimation.duration = 0.28;
+        }
       }
       if (!pending) return;
       if (result.ok) {
@@ -1065,14 +1086,15 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       const start = stone.position.clone();
       const distance = Math.hypot(player.position.x, player.position.z);
       const closeEnoughToPit = distance <= PIT_THROW_RADIUS;
-      const forward = worldForward.clone().applyQuaternion(player.quaternion).normalize();
+      const forwardLanding = getForwardStonePosition(
+        player.position.x,
+        player.position.z,
+        player.rotation.y,
+      );
+      const forwardEnd = new THREE.Vector3(forwardLanding.x, 0.3, forwardLanding.z);
       const end = closeEnoughToPit
-        ? new THREE.Vector3((Math.random() - 0.5) * 4.4, 0.34, (Math.random() - 0.5) * 4.4)
-        : new THREE.Vector3(
-            player.position.x + forward.x * 7.5,
-            0.3,
-            player.position.z + forward.z * 7.5,
-          );
+        ? randomPitLanding()
+        : forwardEnd.clone();
 
       activeThrow = {
         stone,
@@ -1081,6 +1103,8 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         elapsed: 0,
         duration: closeEnoughToPit ? 0.72 : 0.62,
         landsInPit: closeEnoughToPit,
+        forwardEnd,
+        awaitingAuthority: Boolean(actionId),
       };
       if (actionId) {
         pendingActions.set(actionId, {
@@ -1200,16 +1224,9 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         const speed = heldRock ? CARRY_SPEED : WALK_SPEED;
         const nextX = player.position.x + movementX * speed * dt;
         const nextZ = player.position.z + movementZ * speed * dt;
-        const nextDistanceFromCenter = Math.hypot(nextX, nextZ);
-
-        if (nextDistanceFromCenter < PIT_WALL_RADIUS) {
-          const safeScale = PIT_WALL_RADIUS / Math.max(nextDistanceFromCenter, 0.001);
-          player.position.x = nextX * safeScale;
-          player.position.z = nextZ * safeScale;
-        } else if (nextDistanceFromCenter <= FIELD_RADIUS) {
-          player.position.x = nextX;
-          player.position.z = nextZ;
-        }
+        const safePosition = clampPositionOutsidePit(nextX, nextZ);
+        player.position.x = safePosition.x;
+        player.position.z = safePosition.z;
 
         const targetRotation = Math.atan2(-movementX, -movementZ);
         let rotationDelta = targetRotation - player.rotation.y;
@@ -1279,6 +1296,12 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           }
         }
       }
+      for (const rock of rocks) {
+        if (!rock.userData.available || rock.parent !== scene) continue;
+        const deltaX = rock.position.x - player.position.x;
+        const deltaZ = rock.position.z - player.position.z;
+        rock.visible = deltaX * deltaX + deltaZ * deltaZ <= STONE_RENDER_DISTANCE_SQUARED;
+      }
 
       if (multiplayerBlockReason) setMode("none");
       else if (heldRock && !pickupPending) setMode("throw");
@@ -1295,11 +1318,13 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         activeThrow.stone.rotation.x += dt * 8;
         activeThrow.stone.rotation.z += dt * 5;
 
-        if (t >= 1) {
+        const authorityWaitExpired = activeThrow.elapsed >= 2.5;
+        if (t >= 1 && (!activeThrow.awaitingAuthority || authorityWaitExpired)) {
+          const wasAwaitingAuthority = activeThrow.awaitingAuthority;
           const completedStone = activeThrow.stone;
           completedStone.position.copy(activeThrow.end);
           if (activeThrow.landsInPit) addStoneToPit(completedStone);
-          else completedStone.userData.available = true;
+          else completedStone.userData.available = !wasAwaitingAuthority;
           activeThrow = undefined;
           isThrowing = false;
           const deferred = deferredStoneStates.get(
@@ -1309,7 +1334,10 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         }
       }
 
-      const pitDistance = Math.max(0, Math.round(Math.hypot(player.position.x, player.position.z) - 5.2));
+      const pitDistance = Math.max(
+        0,
+        Math.round(Math.hypot(player.position.x, player.position.z) - PIT_WALL_RADIUS),
+      );
       if (pitDistance !== lastDistanceLabel) {
         lastDistanceLabel = pitDistance;
         setDistanceToPit(pitDistance);
@@ -1335,7 +1363,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       );
       camera.lookAt(cameraLookTarget);
       camera.updateMatrixWorld();
-      storybookWorld.update(clock.elapsedTime);
+      storybookWorld.update(clock.elapsedTime, player.position.x, player.position.z);
 
       remoteRenderer.update(
         performance.now(),
@@ -1392,16 +1420,13 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       pitTextureBinding.dispose();
       stoneGeometry.dispose();
       stoneMaterials.forEach((material) => material.dispose());
-      pitFloor.geometry.dispose();
+      pitFloorGeometry.dispose();
       pitFloorMaterial.dispose();
       pitWallGeometry.dispose();
       pitWallMaterial.dispose();
-      pitRim.geometry.dispose();
-      pitRimMaterial.dispose();
-      innerRim.geometry.dispose();
-      innerRimMaterial.dispose();
-      rimClumpGeometry.dispose();
-      rimClumpMaterial.dispose();
+      pitLipGeometry.dispose();
+      pitClodGeometry.dispose();
+      pitLipMaterial.dispose();
       riggedAvatar?.dispose();
       localAvatar.dispose();
       renderer?.dispose();
@@ -1491,7 +1516,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         </div>
         <div className="avatar-nameplate">
           <strong>{profile.name} · {profile.city} <span aria-hidden="true">{flag}</span></strong>
-          <span>Waiting for {profile.reasonText}</span>
+          <span className="sr-only">Waiting for {profile.reasonText}</span>
         </div>
       </div>
 
@@ -1505,15 +1530,6 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           >
             <span className="identity-copy">
               <span className="brand-name">Waitland</span>
-              <span className="identity-line">
-                <span aria-hidden="true">{flag}</span>
-                <span>{profile.name}</span>
-                <span aria-hidden="true">·</span>
-                <span>{profile.city}</span>
-              </span>
-            </span>
-            <span className="profile-edit-icon" aria-hidden="true">
-              <EditIcon />
             </span>
           </button>
 
@@ -1541,7 +1557,10 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         {message || "Keep going"}
       </div>
 
-      <div className="pit-direction" aria-label={`The pit is ${distanceToPit} metres away`}>
+      <div
+        className={`pit-direction ${distanceToPit <= 32 ? "is-hidden" : ""}`}
+        aria-label={`The pit is ${distanceToPit} metres away`}
+      >
         <CompassIcon className="pit-arrow" />
         <span>{distanceToPit}m to pit</span>
       </div>
@@ -1619,7 +1638,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
             </span>
             {actionMode === "throw" ? <span className="throw-mark">↗</span> : null}
           </span>
-          <span className="action-label">
+          <span className="sr-only">
             {actionMode === "pickup" ? "Pick up" : actionMode === "throw" ? "Throw" : "Find one"}
           </span>
         </button>

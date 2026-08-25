@@ -4,6 +4,13 @@ import {
   hairStyleMetrics,
   type AvatarAppearance,
 } from "./avatar-design.ts";
+import type {
+  RiggedAvatarLoadOptions,
+  RiggedAvatarLoadResult,
+  RiggedAvatarManifest,
+  RiggedAvatarRuntime,
+} from "./avatar/rigged-avatar-runtime.ts";
+import { WAITLANDER_RUNTIME_MANIFEST } from "./avatar/waitlander-manifest.ts";
 
 export const MAX_REMOTE_PLAYERS = 64;
 const DEPARTURE_DURATION_MS = 2_650;
@@ -58,9 +65,23 @@ export interface RemoteAvatarRendererOptions {
   maxRenderDistance?: number;
   detailDistance?: number;
   staleAwakeAfterMs?: number;
+  /** Optional authored-instance cap. Production defaults to every visible player. */
+  maxRiggedPlayers?: number;
+  /** Optional compact-viewport cap. Production also defaults to every visible player. */
+  mobileRiggedPlayers?: number;
+  /** Distance inside which visible players may upgrade from procedural to authored GLB. */
+  riggedDistance?: number;
+  /** Test/staging seam. Production defaults to the shared lazy GLB loader. */
+  riggedAvatarLoader?: RemoteRiggedAvatarLoader;
+  riggedManifest?: RiggedAvatarManifest;
 }
 
 export type RemoteOverlayCallback = (anchors: readonly RemoteAvatarAnchor[]) => void;
+export type RemoteAvatarRenderMode = "procedural" | "loading" | "rigged";
+export type RemoteRiggedAvatarLoader = (
+  manifest: RiggedAvatarManifest,
+  options: RiggedAvatarLoadOptions,
+) => Promise<RiggedAvatarLoadResult>;
 
 interface TimedSample {
   time: number;
@@ -105,6 +126,10 @@ interface RemotePlayerState {
   shoeColor: THREE.Color;
   pose: RenderPose;
   anchor: RemoteAvatarAnchor;
+  riggedWanted: boolean;
+  riggedFailed: boolean;
+  riggedLoadController?: AbortController;
+  riggedAvatar?: RiggedAvatarRuntime;
 }
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -120,6 +145,55 @@ function lerpAngle(from: number, to: number, amount: number) {
 
 function easeOutCubic(value: number) {
   return 1 - Math.pow(1 - value, 3);
+}
+
+async function loadRemoteRiggedAvatar(
+  manifest: RiggedAvatarManifest,
+  options: RiggedAvatarLoadOptions,
+) {
+  const { loadRiggedAvatar } = await import("./avatar/rigged-avatar-runtime.ts");
+  return loadRiggedAvatar(manifest, options);
+}
+
+/**
+ * The current shipped GLB has one textured material, so remote customization is
+ * deliberately a gentle whole-model tint. Base colors are retained in userData
+ * so a later appearance update never multiplies an earlier tint into black.
+ */
+export function applyRemoteRiggedAvatarTint(
+  avatar: Pick<RiggedAvatarRuntime, "materials">,
+  appearance: AvatarAppearance,
+) {
+  const white = new THREE.Color(0xffffff);
+  const chooseTint = (material: THREE.Material) => {
+    const name = material.name.toLocaleLowerCase();
+    if (/skin|face|head/.test(name)) return appearance.skin;
+    if (/hair|brow/.test(name)) return appearance.hair;
+    if (/shoe|boot/.test(name)) return appearance.shoes;
+    if (/trouser|pants|jean|short/.test(name)) return appearance.trousers;
+    return appearance.sweater;
+  };
+
+  for (const material of avatar.materials) {
+    if (!("color" in material) || !((material as { color?: unknown }).color instanceof THREE.Color)) {
+      continue;
+    }
+    const color = (material as THREE.Material & { color: THREE.Color }).color;
+    const stored = material.userData.waitlandRemoteBaseColor;
+    const base =
+      Array.isArray(stored) && stored.length === 3
+        ? new THREE.Color(Number(stored[0]), Number(stored[1]), Number(stored[2]))
+        : color.clone();
+    if (!Array.isArray(stored)) {
+      material.userData.waitlandRemoteBaseColor = [base.r, base.g, base.b];
+    }
+    // A broken black base-color factor would black out the texture. Recover to
+    // white before applying a light palette tint, while keeping valid art intact.
+    if (base.r + base.g + base.b < 0.06) base.set(0xffffff);
+    const tint = new THREE.Color(chooseTint(material)).lerp(white, 0.72);
+    color.copy(base).multiply(tint);
+    material.needsUpdate = true;
+  }
 }
 
 function makeInstancedMesh(
@@ -150,12 +224,15 @@ function makeWingGeometry() {
 }
 
 /**
- * A bounded, instanced storybook-character renderer. Richer silhouettes add a
- * fixed number of draw calls, not one object hierarchy per connected person.
+ * Nearby remotes use skeleton-safe clones of the same authored GLB as the
+ * local hero. Bounded instanced characters remain visible while that asset is
+ * loading and become the distance/error LOD when the crowd exceeds the mobile
+ * animation budget.
  */
 export class RemoteAvatarRenderer {
   private readonly scene: THREE.Scene;
   private readonly root = new THREE.Group();
+  private readonly riggedRoot = new THREE.Group();
   private readonly players = new Map<string, RemotePlayerState>();
   private readonly visibleAnchors: RemoteAvatarAnchor[] = [];
 
@@ -236,7 +313,12 @@ export class RemoteAvatarRenderer {
   private readonly extrapolationLimitMs: number;
   private readonly maxRenderDistanceSquared: number;
   private readonly detailDistanceSquared: number;
+  private readonly riggedDistanceSquared: number;
   private readonly staleAwakeAfterMs: number;
+  private readonly maxRiggedPlayers: number;
+  private readonly mobileRiggedPlayers: number;
+  private readonly riggedAvatarLoader: RemoteRiggedAvatarLoader;
+  private readonly riggedManifest: RiggedAvatarManifest;
 
   private clockOffsetMs: number | undefined;
   private disposed = false;
@@ -260,7 +342,24 @@ export class RemoteAvatarRenderer {
     const detailDistance = Math.min(maxDistance, Math.max(5, options.detailDistance ?? 34));
     this.maxRenderDistanceSquared = maxDistance * maxDistance;
     this.detailDistanceSquared = detailDistance * detailDistance;
+    const riggedDistance = Math.min(
+      maxDistance,
+      Math.max(5, options.riggedDistance ?? maxDistance),
+    );
+    this.riggedDistanceSquared = riggedDistance * riggedDistance;
     this.staleAwakeAfterMs = Math.max(5_000, options.staleAwakeAfterMs ?? 30_000);
+    this.maxRiggedPlayers = clamp(
+      Math.floor(options.maxRiggedPlayers ?? this.capacity),
+      0,
+      this.capacity,
+    );
+    this.mobileRiggedPlayers = clamp(
+      Math.floor(options.mobileRiggedPlayers ?? this.maxRiggedPlayers),
+      0,
+      this.maxRiggedPlayers,
+    );
+    this.riggedAvatarLoader = options.riggedAvatarLoader ?? loadRemoteRiggedAvatar;
+    this.riggedManifest = options.riggedManifest ?? WAITLANDER_RUNTIME_MANIFEST;
 
     this.bodies = makeInstancedMesh(this.bodyGeometry, this.sweaterMaterial, this.capacity);
     this.heads = makeInstancedMesh(this.headGeometry, this.skinMaterial, this.capacity);
@@ -321,7 +420,8 @@ export class RemoteAvatarRenderer {
       this.rightWings,
       this.motes,
     ];
-    this.root.add(...this.allMeshes);
+    this.riggedRoot.name = "remote-rigged-avatars";
+    this.root.add(...this.allMeshes, this.riggedRoot);
     this.scene.add(this.root);
   }
 
@@ -345,7 +445,7 @@ export class RemoteAvatarRenderer {
           if (!oldest || candidate.lastReceivedAt < oldest.lastReceivedAt) oldest = candidate;
         }
         if (!oldest || (!oldest.departureAt && now - oldest.lastReceivedAt < this.staleAwakeAfterMs)) return false;
-        this.players.delete(oldest.id);
+        this.deletePlayer(oldest.id);
       }
 
       const appearance = createAvatarAppearance(snapshot.id, snapshot.appearance);
@@ -386,6 +486,8 @@ export class RemoteAvatarRenderer {
           speech: snapshot.speech,
           speechExpiresAt: snapshot.speechExpiresAt,
         },
+        riggedWanted: false,
+        riggedFailed: false,
       };
       this.players.set(snapshot.id, state);
     }
@@ -401,6 +503,7 @@ export class RemoteAvatarRenderer {
       state.hairColor.setHex(appearance.hair);
       state.trouserColor.setHex(appearance.trousers);
       state.shoeColor.setHex(appearance.shoes);
+      if (state.riggedAvatar) applyRemoteRiggedAvatarTint(state.riggedAvatar, appearance);
     }
     if (snapshot.speech !== undefined) state.speech = snapshot.speech;
     if (snapshot.speechExpiresAt !== undefined) state.speechExpiresAt = snapshot.speechExpiresAt;
@@ -434,7 +537,7 @@ export class RemoteAvatarRenderer {
       retained.add(snapshot.id);
     }
     for (const [id, state] of this.players) {
-      if (!retained.has(id) && state.departureAt === undefined) this.players.delete(id);
+      if (!retained.has(id) && state.departureAt === undefined) this.deletePlayer(id);
     }
     for (const snapshot of snapshots) {
       if (snapshot?.id && retained.has(snapshot.id)) this.upsert(snapshot, serverTimeMs);
@@ -452,7 +555,7 @@ export class RemoteAvatarRenderer {
   }
 
   remove(id: string) {
-    return this.players.delete(id);
+    return this.deletePlayer(id);
   }
 
   setSpeech(id: string, speech: string, expiresAt?: number) {
@@ -465,6 +568,14 @@ export class RemoteAvatarRenderer {
 
   getVisibleAnchors(): readonly RemoteAvatarAnchor[] {
     return this.visibleAnchors;
+  }
+
+  getRenderMode(id: string): RemoteAvatarRenderMode | undefined {
+    const state = this.players.get(id);
+    if (!state) return undefined;
+    if (state.riggedWanted && state.riggedAvatar) return "rigged";
+    if (state.riggedWanted && state.riggedLoadController) return "loading";
+    return "procedural";
   }
 
   update(
@@ -481,8 +592,15 @@ export class RemoteAvatarRenderer {
     const renderAt = now - this.interpolationDelayMs;
     const width = Math.max(1, viewport.width);
     const height = Math.max(1, viewport.height);
+    this.selectRiggedPlayers(camera, localPosition, viewport);
+    // Individual rigged roots do not participate in the instanced count reset,
+    // so hide first and reveal only avatars that pass this frame's culling.
+    for (const state of this.players.values()) {
+      if (state.riggedAvatar) state.riggedAvatar.root.visible = false;
+    }
 
     let avatarCount = 0;
+    let shadowCount = 0;
     let detailCount = 0;
     let stoneCount = 0;
     let wingCount = 0;
@@ -495,7 +613,7 @@ export class RemoteAvatarRenderer {
       if (!latest) continue;
       const departing = state.departureAt !== undefined;
       if (!departing && now - state.lastReceivedAt > this.staleAwakeAfterMs) {
-        this.players.delete(id);
+        this.deletePlayer(id);
         continue;
       }
 
@@ -531,43 +649,66 @@ export class RemoteAvatarRenderer {
       this.tempScale.setScalar(exitScale);
       this.rootMatrix.compose(this.tempPosition, this.rootQuaternion, this.tempScale);
 
+      const riggedAvatar = state.riggedWanted ? state.riggedAvatar : undefined;
+      if (riggedAvatar) {
+        riggedAvatar.root.visible = true;
+        riggedAvatar.root.position.copy(this.tempPosition);
+        riggedAvatar.root.quaternion.copy(this.rootQuaternion);
+        riggedAvatar.root.scale.setScalar(exitScale);
+        const wasCarrying = riggedAvatar.motion.carryingStone;
+        if (wasCarrying && !pose.carryingStone && !departing) {
+          riggedAvatar.playInteraction();
+        }
+        riggedAvatar.update(dt, {
+          moving: walking,
+          speed: clamp(speed / 5.5, 0, 1),
+          carryingStone: pose.carryingStone,
+        });
+        riggedAvatar.anchors.speech.getWorldPosition(this.projected).project(camera);
+      }
+
+      const avatarRootMatrix = this.rootMatrix;
+
       const swing = walking ? Math.sin(state.walkPhase) : 0;
       const bob = walking ? Math.abs(Math.sin(state.walkPhase)) * 0.048 : 0;
-      const baseScale =
-        state.appearance.baseId === "compact-sturdy"
-          ? { bodyX: 1.08, bodyY: 0.94, head: 1.06 }
-          : state.appearance.baseId === "gentle-tall"
-            ? { bodyX: 0.94, bodyY: 1.08, head: 0.97 }
-            : { bodyX: 1, bodyY: 1, head: 1 };
-      this.setPart(
-        this.bodies,
-        avatarCount,
-        this.rootMatrix,
-        0,
-        1.42 + bob,
-        0,
-        0,
-        0,
-        0,
-        baseScale.bodyX,
-        baseScale.bodyY,
-        baseScale.bodyX,
-      );
-      this.bodies.setColorAt(avatarCount, state.sweaterColor);
-      this.setPart(this.heads, avatarCount, this.rootMatrix, 0, 2.42 + bob, -0.02, 0, 0, 0, baseScale.head, baseScale.head * 1.04, baseScale.head * 0.98);
-      this.heads.setColorAt(avatarCount, state.skinColor);
+      if (!riggedAvatar) {
+        const baseScale =
+          state.appearance.baseId === "compact-sturdy"
+            ? { bodyX: 1.08, bodyY: 0.94, head: 1.06 }
+            : state.appearance.baseId === "gentle-tall"
+              ? { bodyX: 0.94, bodyY: 1.08, head: 0.97 }
+              : { bodyX: 1, bodyY: 1, head: 1 };
+        this.setPart(
+          this.bodies,
+          avatarCount,
+          avatarRootMatrix,
+          0,
+          1.42 + bob,
+          0,
+          0,
+          0,
+          0,
+          baseScale.bodyX,
+          baseScale.bodyY,
+          baseScale.bodyX,
+        );
+        this.bodies.setColorAt(avatarCount, state.sweaterColor);
+        this.setPart(this.heads, avatarCount, avatarRootMatrix, 0, 2.42 + bob, -0.02, 0, 0, 0, baseScale.head, baseScale.head * 1.04, baseScale.head * 0.98);
+        this.heads.setColorAt(avatarCount, state.skinColor);
 
-      const hair = hairStyleMetrics(state.appearance.hairStyle);
-      this.setPart(this.hairCaps, avatarCount, this.rootMatrix, 0, 2.51 + hair.capOffsetY + bob, 0.03, 0, 0, 0, 1.04, hair.capY, hair.capZ);
-      this.hairCaps.setColorAt(avatarCount, state.hairColor);
-      const bunScale = Math.max(0.001, hair.bunScale);
-      this.setPart(this.hairBuns, avatarCount, this.rootMatrix, 0, hair.bunY + bob, hair.bunZ, 0, 0, 0, bunScale, bunScale, bunScale);
-      this.hairBuns.setColorAt(avatarCount, state.hairColor);
+        const hair = hairStyleMetrics(state.appearance.hairStyle);
+        this.setPart(this.hairCaps, avatarCount, avatarRootMatrix, 0, 2.51 + hair.capOffsetY + bob, 0.03, 0, 0, 0, 1.04, hair.capY, hair.capZ);
+        this.hairCaps.setColorAt(avatarCount, state.hairColor);
+        const bunScale = Math.max(0.001, hair.bunScale);
+        this.setPart(this.hairBuns, avatarCount, avatarRootMatrix, 0, hair.bunY + bob, hair.bunZ, 0, 0, 0, bunScale, bunScale, bunScale);
+        this.hairBuns.setColorAt(avatarCount, state.hairColor);
+        avatarCount += 1;
+      }
 
       const shadowScale = departing ? 0.001 : 1;
       this.setPart(
         this.shadows,
-        avatarCount,
+        shadowCount,
         this.rootMatrix,
         0,
         0.018,
@@ -579,68 +720,81 @@ export class RemoteAvatarRenderer {
         shadowScale,
         shadowScale,
       );
-      avatarCount += 1;
+      shadowCount += 1;
 
       const detailed = distanceSquared <= this.detailDistanceSquared;
-      if (detailed) {
+      if (detailed && !riggedAvatar) {
         const wearsShorts = state.appearance.bottomId === "walking-shorts";
         const trouserY = wearsShorts ? 0.74 : 0.55;
         const trouserScaleY = wearsShorts ? 0.54 : 1.08;
         const trouserWidth = state.appearance.bottomId === "cuffed-trousers" ? 1.16 : 1.08;
-        this.setPart(this.leftLegs, detailCount, this.rootMatrix, -0.22, trouserY, 0, swing * 0.5, 0, 0, trouserWidth, trouserScaleY, trouserWidth);
-        this.setPart(this.rightLegs, detailCount, this.rootMatrix, 0.22, trouserY, 0, -swing * 0.5, 0, 0, trouserWidth, trouserScaleY, trouserWidth);
+        this.setPart(this.leftLegs, detailCount, avatarRootMatrix, -0.22, trouserY, 0, swing * 0.5, 0, 0, trouserWidth, trouserScaleY, trouserWidth);
+        this.setPart(this.rightLegs, detailCount, avatarRootMatrix, 0.22, trouserY, 0, -swing * 0.5, 0, 0, trouserWidth, trouserScaleY, trouserWidth);
         this.leftLegs.setColorAt(detailCount, state.trouserColor);
         this.rightLegs.setColorAt(detailCount, state.trouserColor);
 
         const lowerLegScale = wearsShorts ? 0.57 : 0.001;
-        this.setPart(this.leftLowerLegs, detailCount, this.rootMatrix, -0.22, 0.38, 0, swing * 0.5, 0, 0, 0.92, lowerLegScale, 0.92);
-        this.setPart(this.rightLowerLegs, detailCount, this.rootMatrix, 0.22, 0.38, 0, -swing * 0.5, 0, 0, 0.92, lowerLegScale, 0.92);
+        this.setPart(this.leftLowerLegs, detailCount, avatarRootMatrix, -0.22, 0.38, 0, swing * 0.5, 0, 0, 0.92, lowerLegScale, 0.92);
+        this.setPart(this.rightLowerLegs, detailCount, avatarRootMatrix, 0.22, 0.38, 0, -swing * 0.5, 0, 0, 0.92, lowerLegScale, 0.92);
         this.leftLowerLegs.setColorAt(detailCount, state.skinColor);
         this.rightLowerLegs.setColorAt(detailCount, state.skinColor);
 
         const heldArm = pose.carryingStone ? -0.76 : swing * 0.34;
-        this.setPart(this.leftArms, detailCount, this.rootMatrix, -0.57, 1.49 + bob, 0, -swing * 0.34, 0, 0.04, 0.94, 1, 0.94);
-        this.setPart(this.rightArms, detailCount, this.rootMatrix, 0.57, 1.49 + bob, 0, heldArm, 0, -0.04, 0.94, 1, 0.94);
+        this.setPart(this.leftArms, detailCount, avatarRootMatrix, -0.57, 1.49 + bob, 0, -swing * 0.34, 0, 0.04, 0.94, 1, 0.94);
+        this.setPart(this.rightArms, detailCount, avatarRootMatrix, 0.57, 1.49 + bob, 0, heldArm, 0, -0.04, 0.94, 1, 0.94);
         this.leftArms.setColorAt(detailCount, state.sweaterColor);
         this.rightArms.setColorAt(detailCount, state.sweaterColor);
 
-        this.setPart(this.leftShoes, detailCount, this.rootMatrix, -0.22, 0.16, -0.08, swing * 0.2, 0, 0, 1.05, 0.72, 1.28);
-        this.setPart(this.rightShoes, detailCount, this.rootMatrix, 0.22, 0.16, -0.08, -swing * 0.2, 0, 0, 1.05, 0.72, 1.28);
+        this.setPart(this.leftShoes, detailCount, avatarRootMatrix, -0.22, 0.16, -0.08, swing * 0.2, 0, 0, 1.05, 0.72, 1.28);
+        this.setPart(this.rightShoes, detailCount, avatarRootMatrix, 0.22, 0.16, -0.08, -swing * 0.2, 0, 0, 1.05, 0.72, 1.28);
         this.leftShoes.setColorAt(detailCount, state.shoeColor);
         this.rightShoes.setColorAt(detailCount, state.shoeColor);
 
-        this.setPart(this.leftEyes, detailCount, this.rootMatrix, -0.16, 2.48 + bob, -0.424, 0, 0, 0, 1, 0.72, 0.58);
-        this.setPart(this.rightEyes, detailCount, this.rootMatrix, 0.16, 2.48 + bob, -0.424, 0, 0, 0, 1, 0.72, 0.58);
-        this.setPart(this.noses, detailCount, this.rootMatrix, 0, 2.39 + bob, -0.455, 0, 0, 0, 0.92, 0.76, 0.62);
+        this.setPart(this.leftEyes, detailCount, avatarRootMatrix, -0.16, 2.48 + bob, -0.424, 0, 0, 0, 1, 0.72, 0.58);
+        this.setPart(this.rightEyes, detailCount, avatarRootMatrix, 0.16, 2.48 + bob, -0.424, 0, 0, 0, 1, 0.72, 0.58);
+        this.setPart(this.noses, detailCount, avatarRootMatrix, 0, 2.39 + bob, -0.455, 0, 0, 0, 0.92, 0.76, 0.62);
         this.noses.setColorAt(detailCount, state.skinColor);
-        this.setPart(this.mouths, detailCount, this.rootMatrix, 0, 2.28 + bob, -0.458, 0, 0, Math.PI, 0.9, 0.68, 0.7);
+        this.setPart(this.mouths, detailCount, avatarRootMatrix, 0, 2.28 + bob, -0.458, 0, 0, Math.PI, 0.9, 0.68, 0.7);
         const glassesScale = state.appearance.glasses ? 1 : 0.001;
-        this.setPart(this.leftGlasses, detailCount, this.rootMatrix, -0.16, 2.48 + bob, -0.45, 0, 0, 0, glassesScale, glassesScale, glassesScale);
-        this.setPart(this.rightGlasses, detailCount, this.rootMatrix, 0.16, 2.48 + bob, -0.45, 0, 0, 0, glassesScale, glassesScale, glassesScale);
+        this.setPart(this.leftGlasses, detailCount, avatarRootMatrix, -0.16, 2.48 + bob, -0.45, 0, 0, 0, glassesScale, glassesScale, glassesScale);
+        this.setPart(this.rightGlasses, detailCount, avatarRootMatrix, 0.16, 2.48 + bob, -0.45, 0, 0, 0, glassesScale, glassesScale, glassesScale);
 
         const isHoodie = state.appearance.topId === "soft-hoodie";
         const isCampShirt = state.appearance.topId === "camp-shirt";
         const topDetailScale = isHoodie ? 1 : isCampShirt ? 0.72 : 0.001;
-        this.setPart(this.topDetails, detailCount, this.rootMatrix, 0, isHoodie ? 2.09 + bob : 1.86 + bob, isHoodie ? 0.16 : -0.39, isHoodie ? Math.PI / 2 : 0, 0, 0, topDetailScale, topDetailScale, topDetailScale);
+        this.setPart(this.topDetails, detailCount, avatarRootMatrix, 0, isHoodie ? 2.09 + bob : 1.86 + bob, isHoodie ? 0.16 : -0.39, isHoodie ? Math.PI / 2 : 0, 0, 0, topDetailScale, topDetailScale, topDetailScale);
         this.topDetails.setColorAt(detailCount, state.sweaterColor);
         const pocketScale = isHoodie ? 1 : 0.001;
-        this.setPart(this.pockets, detailCount, this.rootMatrix, 0, 1.28 + bob, -0.47, 0.08, 0, 0, pocketScale, pocketScale, pocketScale);
+        this.setPart(this.pockets, detailCount, avatarRootMatrix, 0, 1.28 + bob, -0.47, 0.08, 0, 0, pocketScale, pocketScale, pocketScale);
         this.pockets.setColorAt(detailCount, state.sweaterColor);
 
         const hasScarf = state.appearance.accessoryIds.includes("soft-scarf");
         const scarfScale = hasScarf ? 1 : 0.001;
-        this.setPart(this.scarves, detailCount, this.rootMatrix, 0, 1.98 + bob, -0.08, Math.PI / 2, 0, 0, scarfScale, scarfScale * 0.72, scarfScale);
+        this.setPart(this.scarves, detailCount, avatarRootMatrix, 0, 1.98 + bob, -0.08, Math.PI / 2, 0, 0, scarfScale, scarfScale * 0.72, scarfScale);
         this.scarves.setColorAt(detailCount, state.sweaterColor);
         const hasBag = state.appearance.accessoryIds.includes("crossbody-bag");
         const bagScale = hasBag ? 1 : 0.001;
-        this.setPart(this.bags, detailCount, this.rootMatrix, 0.43, 1.12 + bob, -0.36, 0, 0.08, -0.08, bagScale, bagScale, bagScale);
+        this.setPart(this.bags, detailCount, avatarRootMatrix, 0.43, 1.12 + bob, -0.36, 0, 0.08, -0.08, bagScale, bagScale, bagScale);
         this.bags.setColorAt(detailCount, state.shoeColor);
         detailCount += 1;
       }
 
       if (detailed && pose.carryingStone && !departing) {
         const spin = now * 0.0006;
-        this.setPart(this.stones, stoneCount, this.rootMatrix, 0.58, 1.7 + bob, -0.3, 0.25, spin, 0.1, 1, 0.8, 1.08);
+        this.setPart(
+          this.stones,
+          stoneCount,
+          riggedAvatar?.anchors.heldItem.matrixWorld ?? this.rootMatrix,
+          riggedAvatar ? 0 : 0.58,
+          riggedAvatar ? 0 : 1.7 + bob,
+          riggedAvatar ? 0 : -0.3,
+          0.25,
+          spin,
+          0.1,
+          1,
+          0.8,
+          1.08,
+        );
         stoneCount += 1;
       }
 
@@ -688,13 +842,13 @@ export class RemoteAvatarRenderer {
       }
     }
 
-    for (const id of completedDepartures) this.players.delete(id);
+    for (const id of completedDepartures) this.deletePlayer(id);
     this.visibleAnchors.length = anchorCount;
     this.finishMesh(this.bodies, avatarCount, true);
     this.finishMesh(this.heads, avatarCount, true);
     this.finishMesh(this.hairCaps, avatarCount, true);
     this.finishMesh(this.hairBuns, avatarCount, true);
-    this.finishMesh(this.shadows, avatarCount, false);
+    this.finishMesh(this.shadows, shadowCount, false);
     this.finishMesh(this.leftLegs, detailCount, true);
     this.finishMesh(this.rightLegs, detailCount, true);
     this.finishMesh(this.leftArms, detailCount, true);
@@ -723,6 +877,7 @@ export class RemoteAvatarRenderer {
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    for (const state of this.players.values()) this.releaseRiggedPlayer(state);
     this.scene.remove(this.root);
     this.players.clear();
     this.visibleAnchors.length = 0;
@@ -759,6 +914,129 @@ export class RemoteAvatarRenderer {
       this.wingMaterial,
       this.moteMaterial,
     ]) material.dispose();
+  }
+
+  private selectRiggedPlayers(
+    camera: THREE.Camera,
+    localPosition: Pick<THREE.Vector3, "x" | "z">,
+    viewport: RemoteViewport,
+  ) {
+    const compactViewport = viewport.width <= 720 || Math.max(viewport.width, viewport.height) <= 900;
+    const budget = compactViewport ? this.mobileRiggedPlayers : this.maxRiggedPlayers;
+    const candidates: Array<{ state: RemotePlayerState; priorityDistance: number }> = [];
+
+    if (budget > 0) {
+      for (const state of this.players.values()) {
+        if (state.riggedFailed) continue;
+        const latest = state.samples[state.samples.length - 1];
+        if (!latest) continue;
+        const dx = latest.x - localPosition.x;
+        const dz = latest.z - localPosition.z;
+        const distanceSquared = dx * dx + dz * dz;
+        if (distanceSquared > this.riggedDistanceSquared) continue;
+        this.projected.set(latest.x, latest.y + 3.22, latest.z).project(camera);
+        const visible =
+          this.projected.z > -1 &&
+          this.projected.z < 1 &&
+          Math.abs(this.projected.x) < 1.28 &&
+          Math.abs(this.projected.y) < 1.38;
+        if (!visible) continue;
+        // Keep an already-instantiated near player across tiny distance-order
+        // changes instead of thrashing skeletons at the budget boundary.
+        candidates.push({
+          state,
+          priorityDistance: distanceSquared * (state.riggedAvatar ? 0.84 : 1),
+        });
+      }
+    }
+
+    candidates.sort((left, right) => left.priorityDistance - right.priorityDistance);
+    const selected = new Set(candidates.slice(0, budget).map(({ state }) => state.id));
+    for (const state of this.players.values()) {
+      this.setRiggedWanted(state, selected.has(state.id));
+    }
+  }
+
+  private setRiggedWanted(state: RemotePlayerState, wanted: boolean) {
+    if (!wanted) {
+      this.releaseRiggedPlayer(state);
+      return;
+    }
+    state.riggedWanted = true;
+    if (!state.riggedAvatar && !state.riggedLoadController && !state.riggedFailed) {
+      this.beginRiggedLoad(state);
+    }
+  }
+
+  private beginRiggedLoad(state: RemotePlayerState) {
+    const controller = new AbortController();
+    state.riggedLoadController = controller;
+    const latest = state.samples[state.samples.length - 1];
+    const initialSpeed = latest ? Math.hypot(latest.vx, latest.vz) : 0;
+
+    void Promise.resolve()
+      .then(() =>
+        this.riggedAvatarLoader(this.riggedManifest, {
+          signal: controller.signal,
+          initialMotion: {
+            moving: Boolean(latest?.moving),
+            speed: clamp(initialSpeed / 5.5, 0, 1),
+            carryingStone: Boolean(latest?.carryingStone),
+          },
+          castShadow: true,
+          receiveShadow: false,
+        }),
+      )
+      .then((result) => {
+        if (state.riggedLoadController !== controller) {
+          if (result.ok) result.avatar.dispose();
+          return;
+        }
+        state.riggedLoadController = undefined;
+        if (!result.ok) {
+          if (result.reason !== "aborted") state.riggedFailed = true;
+          return;
+        }
+        if (
+          this.disposed ||
+          controller.signal.aborted ||
+          !state.riggedWanted ||
+          this.players.get(state.id) !== state
+        ) {
+          result.avatar.dispose();
+          return;
+        }
+        applyRemoteRiggedAvatarTint(result.avatar, state.appearance);
+        result.avatar.root.name = `remote-rigged-avatar:${state.id}`;
+        result.avatar.root.userData.waitlandRemotePlayerId = state.id;
+        result.avatar.root.visible = false;
+        this.riggedRoot.add(result.avatar.root);
+        state.riggedAvatar = result.avatar;
+      })
+      .catch(() => {
+        if (state.riggedLoadController !== controller) return;
+        state.riggedLoadController = undefined;
+        if (!controller.signal.aborted) state.riggedFailed = true;
+      });
+  }
+
+  private releaseRiggedPlayer(state: RemotePlayerState) {
+    state.riggedWanted = false;
+    if (state.riggedLoadController) {
+      state.riggedLoadController.abort();
+      state.riggedLoadController = undefined;
+    }
+    if (state.riggedAvatar) {
+      state.riggedAvatar.dispose();
+      state.riggedAvatar = undefined;
+    }
+  }
+
+  private deletePlayer(id: string) {
+    const state = this.players.get(id);
+    if (!state) return false;
+    this.releaseRiggedPlayer(state);
+    return this.players.delete(id);
   }
 
   private toLocalTime(snapshotTime: number | undefined, serverTime: number | undefined, now: number) {

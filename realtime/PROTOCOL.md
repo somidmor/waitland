@@ -60,13 +60,19 @@ prediction hints and are not authoritative.
 ```
 
 - `seq` must increase for the lifetime of a socket.
+- Movement coordinates must be finite and precisely representable. Rooms
+  enforce server-time speed credit and pit collision, but there is no
+  artificial outer map edge.
 - Action/chat IDs use 1–48 characters from `A-Z a-z 0-9 _ -`.
 - Chat is capped at 80 Unicode characters and a burst of three messages; it
   then refills at three messages per ten seconds.
 - Pickup and throw IDs are idempotency keys. Retrying the same ID returns the
   cached `action` result.
 - A throw deposits only when the authoritative player is within the shared pit
-  throw radius. Otherwise the stone is dropped safely in front of the avatar.
+  throw radius. Otherwise the stone travels 7.5 world units from the
+  action-time pose (shortened only by pit collision) and is dropped in front of
+  the avatar. Later movement while a pit request is pending cannot move that
+  landing point.
 
 Closing the WebSocket makes the actor dormant. The room zeroes velocity,
 releases any held stone at the last position, stores the record privately for
@@ -132,7 +138,12 @@ Stone `upsert` events replace mutable state for that stone ID. A generation
 change means the deterministic descriptor from `getStoneDescriptor(index,
 generation)` should be rebuilt. `pit` updates are coalesced and eventually
 delivered across every active room; the deposit result is immediate for the
-throwing actor.
+throwing actor. For a throw, the authoritative stone `upsert` is sent before
+its `action` acknowledgement on the same socket so the browser can finish the
+visible arc without snapping to stale predicted state. The room retains a
+fixed pool of 84 stone IDs and keeps at least 10 unheld stones within the
+22-unit near-pit ring; recycling increments a generation rather than growing
+room state.
 
 The constant `{"t":"ping"}` heartbeat is intentional: Cloudflare can answer
 it with a WebSocket auto-response while the room isolate remains hibernated.

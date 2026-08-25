@@ -849,7 +849,7 @@ svg {
 .game-hint {
   position: absolute;
   z-index: 7;
-  top: max(190px, calc(env(safe-area-inset-top) + 168px));
+  top: clamp(170px, 27dvh, 250px);
   left: 50%;
   max-width: 78vw;
   transform: translateX(-50%);
@@ -971,6 +971,7 @@ svg {
 
 .avatar-nameplate > span {
   color: rgba(70, 58, 44, 0.72);
+  display: none;
   font-size: 8px;
   font-weight: 610;
 }
@@ -999,6 +1000,11 @@ svg {
   text-shadow: 0 2px 12px rgba(55, 42, 24, 0.38);
   text-transform: uppercase;
   pointer-events: none;
+  transition: opacity 180ms ease;
+}
+
+.pit-direction.is-hidden {
+  opacity: 0;
 }
 
 .pit-arrow {
@@ -1446,32 +1452,18 @@ svg {
   }
 
   .hud-left {
-    width: min(225px, 57vw);
-    gap: 12px;
+    width: min(190px, 44vw);
+    gap: 18px;
   }
 
   .brand-name {
-    font-size: 31px;
-  }
-
-  .identity-line {
-    max-width: 43vw;
-  }
-
-  .profile-edit-icon {
-    width: 22px;
-    height: 22px;
-    flex-basis: 22px;
-  }
-
-  .profile-edit-icon svg {
-    width: 12px;
-    height: 12px;
+    font-size: 22px;
   }
 
   .counter-card {
-    width: min(220px, 57vw);
-    padding: 12px 13px 13px;
+    width: min(190px, 44vw);
+    padding: 11px 12px 12px;
+    border-radius: 20px;
   }
 
   .counter-copy strong {
@@ -1479,9 +1471,9 @@ svg {
   }
 
   .network-presence {
-    min-height: 40px;
-    max-width: 100px;
-    padding-inline: 10px;
+    min-height: 34px;
+    max-width: 92px;
+    padding-inline: 8px;
   }
 
   .network-presence > span:nth-child(2) {
@@ -1497,10 +1489,6 @@ svg {
     flex-basis: 20px;
   }
 
-  .game-hint {
-    top: max(166px, calc(env(safe-area-inset-top) + 144px));
-  }
-
   .joystick {
     bottom: calc(max(17px, env(safe-area-inset-bottom)) + 103px);
     width: 99px;
@@ -1514,7 +1502,7 @@ svg {
 
   .chat-form {
     left: max(14px, env(safe-area-inset-left));
-    width: calc(100vw - 138px);
+    width: calc(100vw - 158px);
     height: 54px;
   }
 

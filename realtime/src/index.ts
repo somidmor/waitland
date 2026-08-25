@@ -1,13 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   FIELD_STONE_COUNT,
+  MIN_NEAR_PIT_STONES,
   PIT_CAPACITY,
   PIT_THROW_RADIUS,
   PIT_WALL_RADIUS,
   PICKUP_RADIUS,
   WORLD_PROTOCOL_VERSION,
-  clampPositionOutsidePit,
+  getNextNearbyStoneGeneration,
+  getForwardStonePosition,
   getStoneDescriptor,
+  isNearPitStonePosition,
   parseStoneIndex,
 } from "../../shared/world.ts";
 import {
@@ -882,16 +885,19 @@ export class FieldRoom extends DurableObject<Env> {
       }
       const stoneRecords = await ctx.storage.list<StoneState>({ prefix: "stone:" });
       if (stoneRecords.size) {
-        for (const [key, stone] of stoneRecords) this.stones.set(key.slice(6), stone);
-      } else {
-        const stones = this.createStones();
-        const records: Record<string, StoneState> = {};
-        for (const stone of stones) {
-          this.stones.set(stone.id, stone);
-          records[`stone:${stone.id}`] = stone;
+        for (const [key, stone] of stoneRecords) {
+          const stoneId = key.slice(6);
+          if (parseStoneIndex(stoneId) === null || stone.id !== stoneId) continue;
+          this.stones.set(stoneId, stone);
         }
-        await ctx.storage.put(records);
       }
+      const missingStoneRecords: Record<string, StoneState> = {};
+      for (const stone of this.createStones()) {
+        if (this.stones.has(stone.id)) continue;
+        this.stones.set(stone.id, stone);
+        missingStoneRecords[`stone:${stone.id}`] = stone;
+      }
+      if (Object.keys(missingStoneRecords).length) await ctx.storage.put(missingStoneRecords);
 
       const savedReservations = (await ctx.storage.get<ReservationStore>("reservations")) || {};
       this.reservations = new Map(Object.entries(savedReservations));
@@ -931,6 +937,9 @@ export class FieldRoom extends DurableObject<Env> {
           stone.holderId = null;
           recoveryRecords[`stone:${stone.id}`] = stone;
         }
+      }
+      for (const stone of this.replenishNearbyStones()) {
+        recoveryRecords[`stone:${stone.id}`] = stone;
       }
       if (Object.keys(recoveryRecords).length) {
         await putStorageRecords(ctx.storage, recoveryRecords);
@@ -1210,7 +1219,9 @@ export class FieldRoom extends DurableObject<Env> {
       }
     }
 
-    const occupied = [...this.players.values()].filter((player) => player.id !== actorId).map(({ x, z }) => ({ x, z }));
+    const occupied = [...this.players.values()]
+      .filter((player) => player.id !== actorId && !player.sleeping)
+      .map(({ x, z }) => ({ x, z }));
     const spawn = safeSpawn(actorId, occupied);
     const now = Date.now();
     const player: StoredPlayer = prior
@@ -1367,6 +1378,7 @@ export class FieldRoom extends DurableObject<Env> {
 
     const stone = this.stones.get(input.stoneId);
     let result: ActionResult;
+    const changedActionStones = new Map<string, StoneState>();
     if (input.t === "pickup") {
       if (!stone || stone.holderId || player.carrying) {
         result = { t: "action", id, ok: false, kind: "pickup", reason: "stone-unavailable" };
@@ -1376,11 +1388,20 @@ export class FieldRoom extends DurableObject<Env> {
         stone.holderId = actorId;
         player.carrying = stone.id;
         result = { t: "action", id, ok: true, kind: "pickup" };
+        changedActionStones.set(stone.id, stone);
         this.broadcast({ t: "stone", op: "upsert", stone });
+        for (const replenished of this.replenishNearbyStones()) {
+          changedActionStones.set(replenished.id, replenished);
+          this.broadcast({ t: "stone", op: "upsert", stone: replenished });
+        }
       }
     } else if (!stone || player.carrying !== stone.id || stone.holderId !== actorId) {
       result = { t: "action", id, ok: false, kind: "throw", reason: "not-carrying" };
     } else {
+      // The pit request below can yield long enough for newer movement to be
+      // accepted. A non-deposit must still land from the pose that initiated
+      // this action, matching the browser's visible throw.
+      const throwPose = { x: player.x, z: player.z, heading: player.heading };
       const distanceFromPit = Math.hypot(player.x, player.z);
       let deposited = false;
       let count: number | undefined;
@@ -1434,13 +1455,23 @@ export class FieldRoom extends DurableObject<Env> {
           holderId: null,
         });
       } else {
-        const dropped = clampPositionOutsidePit(
-          player.x - Math.sin(player.heading) * 1.2,
-          player.z - Math.cos(player.heading) * 1.2,
+        const dropped = getForwardStonePosition(
+          throwPose.x,
+          throwPose.z,
+          throwPose.heading,
         );
         Object.assign(stone, { x: dropped.x, z: dropped.z, holderId: null });
       }
-      this.broadcast({ t: "stone", op: "upsert", stone });
+      changedActionStones.set(stone.id, stone);
+      for (const replenished of this.replenishNearbyStones(deposited ? undefined : stone.id)) {
+        changedActionStones.set(replenished.id, replenished);
+      }
+      // Stone state intentionally precedes the action acknowledgement on this
+      // socket. The browser defers that authoritative upsert until its visible
+      // arc finishes, preventing an acknowledgement race from snapping it.
+      for (const changed of changedActionStones.values()) {
+        this.broadcast({ t: "stone", op: "upsert", stone: changed });
+      }
       result = { t: "action", id, ok: reason !== "pit-unavailable", kind: "throw", deposited, count, reason };
     }
 
@@ -1450,10 +1481,13 @@ export class FieldRoom extends DurableObject<Env> {
     player.lastSeenAt = Date.now();
     this.dirtyPlayers.add(actorId);
     this.scheduleFrame();
-    await Promise.all([
-      this.ctx.storage.put(`player:${actorId}`, player),
-      ...(stone ? [this.ctx.storage.put(`stone:${stone.id}`, stone)] : []),
-    ]);
+    const actionRecords: Record<string, StoredPlayer | StoneState> = {
+      [`player:${actorId}`]: player,
+    };
+    for (const changed of changedActionStones.values()) {
+      actionRecords[`stone:${changed.id}`] = changed;
+    }
+    await this.ctx.storage.put(actionRecords);
     this.send(socket, result);
   }
 
@@ -1574,6 +1608,42 @@ export class FieldRoom extends DurableObject<Env> {
       stones.push({ id: descriptor.id, x: descriptor.x, z: descriptor.z, generation: 0, holderId: null });
     }
     return stones;
+  }
+
+  /** Keeps a fixed-size pool useful without growing room state over time. */
+  private replenishNearbyStones(excludedStoneId?: string) {
+    let nearbyCount = 0;
+    const recyclable: StoneState[] = [];
+    for (const stone of this.stones.values()) {
+      if (stone.holderId) continue;
+      if (isNearPitStonePosition(stone.x, stone.z)) nearbyCount += 1;
+      else if (stone.id !== excludedStoneId) recyclable.push(stone);
+    }
+    if (nearbyCount >= MIN_NEAR_PIT_STONES) return [];
+
+    recyclable.sort((left, right) => {
+      const distanceOrder = Math.hypot(right.x, right.z) - Math.hypot(left.x, left.z);
+      return distanceOrder || left.id.localeCompare(right.id);
+    });
+    const changed: StoneState[] = [];
+    for (const stone of recyclable) {
+      if (nearbyCount >= MIN_NEAR_PIT_STONES) break;
+      const index = parseStoneIndex(stone.id);
+      if (index === null) continue;
+      const descriptor = getStoneDescriptor(
+        index,
+        getNextNearbyStoneGeneration(stone.generation),
+      );
+      Object.assign(stone, {
+        x: descriptor.x,
+        z: descriptor.z,
+        generation: descriptor.generation,
+        holderId: null,
+      });
+      changed.push(stone);
+      nearbyCount += 1;
+    }
+    return changed;
   }
 
   private activeCount() {

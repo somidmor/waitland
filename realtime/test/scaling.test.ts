@@ -6,6 +6,12 @@ import worker, {
   PitCoordinator,
 } from "../src/index.ts";
 import {
+  FIELD_STONE_COUNT,
+  MIN_NEAR_PIT_STONES,
+  getForwardStonePosition,
+  isNearPitStonePosition,
+} from "../../shared/world.ts";
+import {
   ACTIVE_NEW_JOIN_LOBBY_SHARDS,
   LOBBY_SHARD_COUNT,
   isActiveNewJoinLobbyId,
@@ -653,6 +659,224 @@ test("field rooms register hibernatable heartbeats and reject new actors at the 
   }));
   assert.equal(response.status, 409);
   assert.equal((await response.json()).reason, "room-sleeper-limit");
+});
+
+test("field initialization repairs a fixed stone pool and keeps ten available near the pit", async () => {
+  const initial: Record<string, unknown> = {};
+  for (let index = 0; index < FIELD_STONE_COUNT; index += 1) {
+    initial[`stone:stone-${index}`] = {
+      id: `stone-${index}`,
+      x: 2_000 + index,
+      z: -2_000,
+      generation: 0,
+      holderId: null,
+    };
+  }
+  const state = new MockState(new MemoryStorage(initial));
+  new FieldRoom(state as unknown as DurableObjectState, envWith({}));
+  await state.ready;
+
+  const storedStones = [...state.storage.records.entries()]
+    .filter(([key]) => key.startsWith("stone:"))
+    .map(([, value]) => value as { x: number; z: number; holderId: string | null });
+  assert.equal(storedStones.length, FIELD_STONE_COUNT);
+  assert.ok(
+    storedStones.filter(
+      (stone) => !stone.holderId && isNearPitStonePosition(stone.x, stone.z),
+    ).length >= MIN_NEAR_PIT_STONES,
+  );
+});
+
+test("picking up the tenth nearby stone immediately replenishes the fixed pool", async () => {
+  const actorId = uuid(95_050);
+  const connectionId = uuid(95_051);
+  const now = Date.now();
+  const nearbyStoneId = "stone-0";
+  const player: StoredPlayer = {
+    id: actorId,
+    x: 8,
+    z: 0,
+    vx: 0,
+    vz: 0,
+    heading: 0,
+    carrying: null,
+    sleeping: false,
+    profile: {
+      name: "Collector",
+      city: "Somewhere",
+      countryCode: "XX",
+      countryFlag: "🌍",
+      waitReason: "Waiting",
+    },
+    lastMoveAt: now,
+    lastSeenAt: now,
+    lastSeq: -1,
+    actionHistory: [],
+  };
+  const initial: Record<string, unknown> = {
+    "room-id": `field-${uuid(95_052)}`,
+    [`player:${actorId}`]: player,
+  };
+  for (let index = 0; index < FIELD_STONE_COUNT; index += 1) {
+    initial[`stone:stone-${index}`] = {
+      id: `stone-${index}`,
+      x: index < MIN_NEAR_PIT_STONES ? 8 + index * 0.8 : 2_000 + index,
+      z: index < MIN_NEAR_PIT_STONES ? 0 : -2_000,
+      generation: 0,
+      holderId: null,
+    };
+  }
+
+  const messages: Array<Record<string, unknown>> = [];
+  const socket = {
+    deserializeAttachment: () => ({ actorId, connectionId }),
+    send: (message: string) => messages.push(JSON.parse(message) as Record<string, unknown>),
+  } as unknown as WebSocket;
+  const state = new MockState(new MemoryStorage(initial), [socket]);
+  const room = new FieldRoom(state as unknown as DurableObjectState, envWith({}));
+  await state.ready;
+
+  await room.webSocketMessage(
+    socket,
+    JSON.stringify({ t: "pickup", id: "pickup-tenth-nearby", stoneId: nearbyStoneId }),
+  );
+
+  const storedStones = [...state.storage.records.entries()]
+    .filter(([key]) => key.startsWith("stone:"))
+    .map(
+      ([, value]) =>
+        value as {
+          id: string;
+          x: number;
+          z: number;
+          generation: number;
+          holderId: string | null;
+        },
+    );
+  const nearbyAvailable = storedStones.filter(
+    (stone) => !stone.holderId && isNearPitStonePosition(stone.x, stone.z),
+  );
+  assert.equal(storedStones.length, FIELD_STONE_COUNT);
+  assert.equal(nearbyAvailable.length, MIN_NEAR_PIT_STONES);
+  assert.equal(
+    (state.storage.records.get(`stone:${nearbyStoneId}`) as { holderId: string | null }).holderId,
+    actorId,
+  );
+  assert.equal(
+    (state.storage.records.get(`player:${actorId}`) as StoredPlayer).carrying,
+    nearbyStoneId,
+  );
+
+  const replenished = nearbyAvailable.find((stone) => stone.generation > 0);
+  assert.ok(replenished);
+  const stoneMessages = messages.filter((message) => message.t === "stone");
+  assert.ok(
+    stoneMessages.some(
+      (message) =>
+        (message.stone as { id?: string } | undefined)?.id === replenished.id,
+    ),
+  );
+  const actionMessageIndex = messages.findIndex(
+    (message) => message.t === "action" && message.id === "pickup-tenth-nearby",
+  );
+  const replenishedMessageIndex = messages.findIndex(
+    (message) =>
+      message.t === "stone" &&
+      (message.stone as { id?: string } | undefined)?.id === replenished.id,
+  );
+  assert.ok(replenishedMessageIndex >= 0);
+  assert.ok(actionMessageIndex > replenishedMessageIndex);
+});
+
+test("a delayed throw acknowledgement keeps the action-time forward landing and wire order", async () => {
+  const actorId = uuid(95_100);
+  const connectionId = uuid(95_101);
+  const now = Date.now();
+  const carriedStoneId = "stone-0";
+  const storedPlayer: StoredPlayer = {
+    id: actorId,
+    x: 10,
+    z: 0,
+    vx: 0,
+    vz: 0,
+    heading: 0,
+    carrying: carriedStoneId,
+    sleeping: false,
+    profile: {
+      name: "Thrower",
+      city: "Somewhere",
+      countryCode: "XX",
+      countryFlag: "🌍",
+      waitReason: "Waiting",
+    },
+    lastMoveAt: now,
+    lastSeenAt: now,
+    lastSeq: -1,
+    actionHistory: [],
+  };
+  const messages: Array<Record<string, unknown>> = [];
+  const socket = {
+    deserializeAttachment: () => ({ actorId, connectionId }),
+    send: (message: string) => messages.push(JSON.parse(message) as Record<string, unknown>),
+  } as unknown as WebSocket;
+  const storage = new MemoryStorage({
+    "room-id": `field-${uuid(95_102)}`,
+    [`player:${actorId}`]: storedPlayer,
+    [`stone:${carriedStoneId}`]: {
+      id: carriedStoneId,
+      x: storedPlayer.x,
+      z: storedPlayer.z,
+      generation: 0,
+      holderId: actorId,
+    },
+  });
+  let markDepositStarted: (() => void) | undefined;
+  const depositStarted = new Promise<void>((resolve) => {
+    markDepositStarted = resolve;
+  });
+  let finishDeposit: ((response: Response) => void) | undefined;
+  const pit = namespace(async (_name, request) => {
+    assert.equal(new URL(request.url).pathname, "/deposit");
+    markDepositStarted?.();
+    return new Promise<Response>((resolve) => {
+      finishDeposit = resolve;
+    });
+  });
+  const state = new MockState(storage, [socket]);
+  const room = new FieldRoom(
+    state as unknown as DurableObjectState,
+    envWith({ PIT: pit }),
+  );
+  await state.ready;
+
+  const actionId = "delayed-throw";
+  const throwing = room.webSocketMessage(
+    socket,
+    JSON.stringify({ t: "throw", id: actionId, stoneId: carriedStoneId }),
+  );
+  await depositStarted;
+  await room.webSocketMessage(
+    socket,
+    JSON.stringify({ t: "move", seq: 0, x: 10, z: 0, heading: Math.PI }),
+  );
+  assert.ok(finishDeposit);
+  finishDeposit(Response.json({ accepted: false, count: 1_000 }));
+  await throwing;
+
+  const stoneMessageIndex = messages.findIndex(
+    (message) =>
+      message.t === "stone" &&
+      (message.stone as { id?: string } | undefined)?.id === carriedStoneId,
+  );
+  const actionMessageIndex = messages.findIndex(
+    (message) => message.t === "action" && message.id === actionId,
+  );
+  assert.ok(stoneMessageIndex >= 0);
+  assert.ok(actionMessageIndex > stoneMessageIndex);
+  const stoneMessage = messages[stoneMessageIndex].stone as { x: number; z: number };
+  const expected = getForwardStonePosition(10, 0, 0);
+  assert.deepEqual({ x: stoneMessage.x, z: stoneMessage.z }, expected);
+  assert.equal(Math.hypot(stoneMessage.x - 10, stoneMessage.z), 7.5);
 });
 
 test("a dormant field room expires sleepers on its alarm and schedules the next retention deadline", async () => {

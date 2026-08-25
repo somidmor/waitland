@@ -46,6 +46,8 @@ when the application moved to native Cloudflare Workers.
   - `arrival-screen.tsx`: no-account arrival/profile flow.
   - `waiting-pit.tsx`: main game orchestration, input, HUD, and realtime event
     integration.
+  - `pit-geometry.ts`: the shared irregular excavation contours used by the
+    meadow opening, dirt lip, wall, and floor.
   - `world-art.ts`: Three.js terrain, pit, stones, environment dressing,
     shadows, and departure visuals.
   - `avatar/`: versioned rigged-avatar manifest/runtime plus the procedural
@@ -234,18 +236,21 @@ Rules:
 
 ## Avatar and 3D asset boundary
 
-The local hero now prefers a versioned, rigged Meshy GLB with idle, walk, and
-pick/throw clips. It is lazy-loaded behind `avatar/waitlander-manifest.ts` and
-falls back to the deterministic procedural Three.js avatar if loading or WebGL
-support fails. Remote crowds remain lightweight instanced procedural avatars.
-Preserve these boundaries so customization does not require rewriting gameplay
-or transport:
+The local hero and every visible remote player now prefer one versioned,
+rigged Meshy GLB with idle, walk, and pick/throw clips. It is
+lazy-loaded behind `avatar/waitlander-manifest.ts`; decoded geometry and
+textures are shared while each visible player owns the skeleton and animation
+state required by Three.js. The deterministic procedural avatar remains the
+loading/error fallback; remote distance and instance options are explicit
+operational escape hatches rather than production defaults. Preserve these boundaries so
+customization does not require rewriting gameplay or transport:
 
 - Profile/avatar selection produces a stable avatar descriptor.
 - `avatar-design.ts` maps that descriptor to visual parts/material choices.
-- Procedural local/fallback and remote renderers consume the same descriptor.
-- The rigged local renderer consumes a versioned asset manifest whose anchors
-  and clip aliases isolate gameplay from mesh-specific names.
+- Procedural local/fallback and remote LOD renderers consume the same
+  descriptor.
+- Rigged local and nearby-remote renderers consume a versioned asset manifest
+  whose anchors and clip aliases isolate gameplay from mesh-specific names.
 - Today, procedural appearances are derived deterministically from the actor ID;
   the protocol carries no appearance field. Future customization should add a
   compact descriptor or identifier, never raw models or textures.
