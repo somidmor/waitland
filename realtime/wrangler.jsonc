@@ -1,0 +1,48 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "waitland-realtime",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-25",
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "realtime.waitland.app",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "ALLOWED_ORIGINS": "https://waitland.app,https://www.waitland.app"
+  },
+  "secrets": {
+    "required": ["SESSION_SECRET"]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "LOBBY", "class_name": "Lobby" },
+      { "name": "ROOMS", "class_name": "FieldRoom" },
+      { "name": "PIT", "class_name": "PitCoordinator" },
+      { "name": "PIT_FANOUT", "class_name": "PitFanout" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Lobby", "FieldRoom", "PitCoordinator", "PitFanout"]
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.01
+    }
+  },
+  "placement": {
+    "mode": "smart"
+  }
+}

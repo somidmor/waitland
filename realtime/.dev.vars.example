@@ -1,0 +1,4 @@
+# Local-only signing key. Generate a different value with:
+#   openssl rand -base64 48
+# Production uses `wrangler secret put SESSION_SECRET`; never copy that secret here.
+SESSION_SECRET=replace-with-at-least-32-random-characters

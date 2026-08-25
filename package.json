@@ -1,0 +1,60 @@
+{
+  "name": "waitland-web",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vinext build",
+    "preview": "vite preview",
+    "start": "vinext start",
+    "test": "npm run test:site && npm run realtime:verify",
+    "test:site": "npm run build && node --test tests/*.test.mjs",
+    "realtime:build": "npm --prefix realtime run build",
+    "realtime:test": "npm --prefix realtime test",
+    "realtime:verify": "npm --prefix realtime run verify",
+    "realtime:smoke": "node realtime/scripts/realtime-harness.mjs --smoke",
+    "realtime:load": "node realtime/scripts/realtime-harness.mjs --load",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.worker.json",
+    "lint": "eslint .",
+    "types:cloudflare": "wrangler types worker-configuration.d.ts --config wrangler.jsonc --include-runtime=false",
+    "types:cloudflare:realtime": "npm --prefix realtime run types:cloudflare",
+    "cloudflare:check:web": "npm run build && wrangler deploy --dry-run --outdir .wrangler/web-dry-run",
+    "cloudflare:check:realtime": "wrangler deploy --config realtime/wrangler.jsonc --dry-run --outdir .wrangler/realtime-dry-run",
+    "cloudflare:check": "npm run cloudflare:check:web && npm run cloudflare:check:realtime",
+    "deploy:web": "npm run build && wrangler deploy",
+    "deploy:realtime": "npm --prefix realtime run deploy",
+    "deploy:all": "npm run deploy:realtime && npm run deploy:web"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.2",
+    "next": "16.2.6",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.37.1",
+    "@cloudflare/workers-types": "4.20260702.1",
+    "@tailwindcss/postcss": "4.2.1",
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@types/three": "^0.180.0",
+    "@vitejs/plugin-react": "6.0.2",
+    "@vitejs/plugin-rsc": "0.5.26",
+    "drizzle-kit": "0.31.10",
+    "eslint": "9.39.4",
+    "eslint-config-next": "16.2.6",
+    "react-server-dom-webpack": "19.2.6",
+    "tailwindcss": "4.2.1",
+    "typescript": "5.9.3",
+    "vinext": "0.0.50",
+    "vite": "8.0.13",
+    "wrangler": "4.92.0"
+  },
+  "type": "module",
+  "displayName": "Waitland"
+}

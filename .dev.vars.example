@@ -1,0 +1,3 @@
+# Root Waitland Vinext Worker, used only for local development.
+# Start the realtime Worker on port 8787 before starting the web app.
+REALTIME_ORIGIN=http://localhost:8787

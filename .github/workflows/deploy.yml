@@ -1,0 +1,138 @@
+name: Deploy Waitland
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: waitland-production
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            realtime/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Install realtime dependencies
+        run: npm --prefix realtime ci
+
+      - name: Type-check web application
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run all tests
+        run: npm test
+
+      - name: Validate both Cloudflare bundles
+        run: npm run cloudflare:check
+
+  deploy-realtime:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: realtime/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: realtime
+
+      - name: Confirm the existing realtime Worker is in this account
+        run: ./node_modules/.bin/wrangler deployments list --config wrangler.jsonc
+        working-directory: realtime
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Verify and deploy existing realtime Worker
+        run: npm run deploy
+        working-directory: realtime
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  deploy-web:
+    needs: deploy-realtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and deploy web Worker
+        run: npm run deploy:web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  verify-production:
+    needs: deploy-web
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify public HTTP endpoints
+        run: node scripts/verify-production.mjs
+
+      - name: Verify a complete realtime exchange
+        run: node realtime/scripts/realtime-harness.mjs --smoke
+        env:
+          REALTIME_ORIGIN: https://realtime.waitland.app
+          WEB_ORIGIN: https://waitland.app
+
+      - name: Verify two simultaneous realtime clients
+        run: node realtime/scripts/realtime-harness.mjs --load
+        env:
+          ALLOW_LOAD_TEST: "yes"
+          CLIENTS: "2"
+          DURATION_SECONDS: "8"
+          MOVES_PER_SECOND: "4"
+          REALTIME_ORIGIN: https://realtime.waitland.app
+          WEB_ORIGIN: https://waitland.app
