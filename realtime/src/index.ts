@@ -10,6 +10,7 @@ import {
   getNextNearbyStoneGeneration,
   getForwardStonePosition,
   getStoneDescriptor,
+  headingTowardPit,
   isNearPitStonePosition,
   parseStoneIndex,
 } from "../../shared/world.ts";
@@ -1246,7 +1247,7 @@ export class FieldRoom extends DurableObject<Env> {
           z: spawn.z,
           vx: 0,
           vz: 0,
-          heading: Math.atan2(-spawn.x, -spawn.z),
+          heading: headingTowardPit(spawn.x, spawn.z),
           carrying: null,
           sleeping: false,
           lastMoveAt: now,

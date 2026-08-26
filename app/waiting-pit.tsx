@@ -30,13 +30,26 @@ import {
   RemoteAvatarRenderer,
   type RemoteAvatarAnchor,
   type RemotePlayerSnapshot,
+  type RemoteStoneRelease,
 } from "./remote-avatar-renderer";
 import { createProceduralAvatar, type RiggedAvatarRuntime } from "./avatar";
 import { createAvatarAppearance } from "./avatar-design";
 import { WAITLANDER_RUNTIME_MANIFEST } from "./avatar/waitlander-manifest";
 import {
+  bakeSinglePrimitiveEnvironmentGeometry,
+  clearEnvironmentAssetCache,
+  environmentAssetCacheKey,
+  loadEnvironmentAsset,
+  type EnvironmentAssetLease,
+} from "./environment/environment-asset-runtime";
+import {
+  WAITLAND_GAMEPLAY_STONE_ASSET_MANIFEST,
+  WAITLAND_PIT_ASSET_MANIFEST,
+} from "./environment/environment-manifest";
+import {
   createPitFloorGeometry,
   createPitLipGeometry,
+  createPitTurfGeometry,
   createPitWallGeometry,
 } from "./pit-geometry";
 import { CompassIcon, PeopleIcon, SendIcon, StoneIcon } from "./ui-icons";
@@ -50,11 +63,82 @@ const CAPACITY = PIT_CAPACITY;
 const STORAGE_KEY = "waiting-pit-stones-v1";
 const REMOTE_SPEECH_TTL_MS = 7_000;
 const STONE_RENDER_DISTANCE_SQUARED = 25 * 25;
+const AUTHORED_PIT_CONTENT_LIFT = 0.05;
+const PIT_BASE_STONE_COUNT = 84;
 
 type ActionMode = "none" | "pickup" | "throw";
+type StoneMaterial = THREE.Material | THREE.Material[];
+
+const AUTHORED_STONE_TINTS = [0xa9c0c1, 0x91aaa7, 0xb0b5aa, 0x899b9a] as const;
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function cloneAuthoredStoneMaterials(
+  source: THREE.Material | readonly THREE.Material[],
+): StoneMaterial[] {
+  const isMultiMaterial = Array.isArray(source);
+  const sourceMaterials: readonly THREE.Material[] = isMultiMaterial
+    ? source
+    : [source as THREE.Material];
+  return AUTHORED_STONE_TINTS.map((tint) => {
+    const variants = sourceMaterials.map((material) => {
+      const variant = material.clone();
+      if (variant instanceof THREE.MeshStandardMaterial) {
+        // Meshy's PBR maps carry the stone detail. A light, deterministic base
+        // tint creates variety without multiplying the texture down to black.
+        variant.color.setHex(tint);
+        variant.roughness = Math.max(0.78, variant.roughness);
+        variant.metalness = Math.min(0.08, variant.metalness);
+      }
+      variant.needsUpdate = true;
+      return variant;
+    });
+    return isMultiMaterial ? variants : variants[0];
+  });
+}
+
+function applyAuthoredPitSurface(
+  source: THREE.Material | readonly THREE.Material[],
+  targets: readonly {
+    material: THREE.MeshStandardMaterial;
+    tint: THREE.ColorRepresentation;
+  }[],
+) {
+  const sourceMaterials: readonly THREE.Material[] = Array.isArray(source)
+    ? source
+    : [source as THREE.Material];
+  const authored = sourceMaterials.find(
+    (material): material is THREE.MeshStandardMaterial =>
+      material instanceof THREE.MeshStandardMaterial,
+  );
+  if (!authored) return false;
+
+  for (const target of targets) {
+    // Meshy supplies the physical response while the purpose-built tileable
+    // earth image keeps the procedural excavation's UVs visually coherent.
+    // A generated atlas is not stretched around the whole gameplay-owned rim.
+    if (authored.normalMap) target.material.normalMap = authored.normalMap;
+    target.material.roughnessMap = authored.roughnessMap;
+    target.material.metalnessMap = authored.metalnessMap;
+    target.material.aoMap = authored.aoMap;
+    target.material.normalScale.copy(authored.normalScale);
+    target.material.color.set(target.tint);
+    target.material.roughness = Math.max(0.88, authored.roughness);
+    target.material.metalness = Math.min(0.04, authored.metalness);
+    target.material.needsUpdate = true;
+  }
+  return true;
+}
+
+function disposeStoneMaterials(materials: readonly StoneMaterial[]) {
+  const unique = new Set<THREE.Material>();
+  for (const material of materials) {
+    if (Array.isArray(material)) material.forEach((entry) => unique.add(entry));
+    else unique.add(material);
+  }
+  unique.forEach((material) => material.dispose());
 }
 
 function randomPitLanding() {
@@ -173,10 +257,10 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
 
     const scene = new THREE.Scene();
     scene.background = null;
-    scene.fog = new THREE.Fog(0xe8bb78, 58, 138);
+    scene.fog = new THREE.Fog(0xd9b77d, 52, 132);
 
-    const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 160);
-    camera.position.set(0, 12, 36);
+    const camera = new THREE.PerspectiveCamera(44, 1, 0.1, 160);
+    camera.position.set(0, 11.6, 36);
 
     let renderer: THREE.WebGLRenderer | null = null;
     let worldFallback: HTMLDivElement | null = null;
@@ -188,11 +272,11 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       renderer.shadowMap.type = THREE.PCFSoftShadowMap;
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
-      renderer.toneMappingExposure = 1.02;
+      renderer.toneMappingExposure = 0.95;
       renderer.domElement.className = "world-canvas";
       renderer.domElement.setAttribute(
         "aria-label",
-        "A peaceful 3D meadow with a circular pit and scattered stones",
+        "A peaceful 3D meadow with an irregular pit and scattered stones",
       );
       mount.appendChild(renderer.domElement);
     } catch {
@@ -206,31 +290,46 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       mount.appendChild(worldFallback);
     }
 
-    scene.add(new THREE.HemisphereLight(0xffe8c8, 0x39452d, 1.72));
-    const sun = new THREE.DirectionalLight(0xffdfad, 2.85);
-    sun.position.set(-24, 31, 18);
+    scene.add(new THREE.HemisphereLight(0xffe6c4, 0x6e5b3d, 1));
+    const sun = new THREE.DirectionalLight(0xffc77e, 3.2);
+    sun.position.set(-22, 30, 22);
     sun.castShadow = true;
     sun.shadow.mapSize.set(1024, 1024);
     sun.shadow.camera.left = -34;
     sun.shadow.camera.right = 34;
     sun.shadow.camera.top = 34;
     sun.shadow.camera.bottom = -34;
+    sun.shadow.normalBias = 0.025;
+    sun.shadow.radius = 2;
     scene.add(sun);
 
     const storybookWorld = createStorybookWorld(scene);
+    const authoredAssetController = new AbortController();
+    let authoredPitLease: EnvironmentAssetLease | null = null;
+    let authoredPitCacheKey = environmentAssetCacheKey(WAITLAND_PIT_ASSET_MANIFEST);
+    let authoredStoneLease: EnvironmentAssetLease | null = null;
+    let authoredStoneCacheKey = environmentAssetCacheKey(
+      WAITLAND_GAMEPLAY_STONE_ASSET_MANIFEST,
+    );
+    let authoredStoneGeometry: THREE.BufferGeometry | null = null;
+    let authoredStoneMaterials: StoneMaterial[] | null = null;
 
     const pitGroup = new THREE.Group();
+    pitGroup.name = "waitland-pit";
     scene.add(pitGroup);
+    const pitContentsGroup = new THREE.Group();
+    pitContentsGroup.name = "waitland-pit-recessed-contents";
+    pitGroup.add(pitContentsGroup);
 
     const pitFloorMaterial = new THREE.MeshStandardMaterial({
-      color: 0x493a31,
+      color: 0x4b392c,
       roughness: 1,
       metalness: 0,
     });
     const pitFloorGeometry = createPitFloorGeometry();
     const pitFloor = new THREE.Mesh(pitFloorGeometry, pitFloorMaterial);
     pitFloor.receiveShadow = true;
-    pitGroup.add(pitFloor);
+    pitContentsGroup.add(pitFloor);
 
     const pitWallMaterial = new THREE.MeshStandardMaterial({
       color: 0x654735,
@@ -255,6 +354,17 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     pitLip.receiveShadow = true;
     pitGroup.add(pitLip);
 
+    const pitTurfMaterial = new THREE.MeshStandardMaterial({
+      color: 0xd7d8ad,
+      roughness: 1,
+      metalness: 0,
+    });
+    const pitTurfGeometry = createPitTurfGeometry();
+    const pitTurf = new THREE.Mesh(pitTurfGeometry, pitTurfMaterial);
+    pitTurf.castShadow = true;
+    pitTurf.receiveShadow = true;
+    pitGroup.add(pitTurf);
+
     const pitClodGeometry = new THREE.DodecahedronGeometry(0.4, 0);
     const pitClods = new THREE.InstancedMesh(pitClodGeometry, pitLipMaterial, 8);
     const pitClodTransform = new THREE.Object3D();
@@ -263,10 +373,12 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       const radius = PIT_RADIUS + 0.46 + Math.sin(index * 4.17) * 0.2;
       pitClodTransform.position.set(
         Math.cos(angle) * radius * 1.035,
-        -0.015 + (index % 3) * 0.018,
+        -0.035 + (index % 3) * 0.012,
         Math.sin(angle) * radius,
       );
-      pitClodTransform.rotation.set(index * 0.37, -angle, index * 0.21);
+      // Keep torn sod clods flush with the ground. Tilting a strongly flattened
+      // dodecahedron creates black needle silhouettes at phone scale.
+      pitClodTransform.rotation.set(0, -angle, 0);
       pitClodTransform.scale.set(
         0.72 + (index % 4) * 0.09,
         0.12 + (index % 3) * 0.035,
@@ -281,45 +393,104 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
 
     const pitTextureBinding = attachEnvironmentMaterialTextures(
       [
-        { material: pitFloorMaterial, texturedColor: 0x5d5044 },
-        { material: pitWallMaterial, texturedColor: 0x765c49 },
-        { material: pitLipMaterial, texturedColor: 0xa98d6d },
+        { material: pitFloorMaterial, texturedColor: 0x745d49 },
+        { material: pitWallMaterial, texturedColor: 0x8f755d },
+        { material: pitLipMaterial, texturedColor: 0xb49a76 },
       ],
       ENVIRONMENT_TEXTURE_PATHS.pit,
       { repeat: 3, normalScale: 0.38 },
     );
+    const pitTurfTextureBinding = attachEnvironmentMaterialTextures(
+      [{ material: pitTurfMaterial, texturedColor: 0xe4e3bd }],
+      ENVIRONMENT_TEXTURE_PATHS.grass,
+      { repeat: 3, normalScale: 0.2 },
+    );
+
+    gameMount.dataset.pitRenderer = "procedural-fallback";
+    void (async () => {
+      const result = await loadEnvironmentAsset(WAITLAND_PIT_ASSET_MANIFEST, {
+        signal: authoredAssetController.signal,
+      });
+      if (!result.ok) return;
+      if (disposed) {
+        result.asset.dispose();
+        clearEnvironmentAssetCache(result.cacheKey);
+        return;
+      }
+      try {
+        const sourceMaterial = result.asset.template.primitives[0]?.material;
+        if (
+          !sourceMaterial ||
+          !applyAuthoredPitSurface(sourceMaterial, [
+            { material: pitWallMaterial, tint: 0x9a826a },
+            { material: pitLipMaterial, tint: 0xbca781 },
+          ])
+        ) {
+          throw new Error("The authored pit has no reusable PBR surface material.");
+        }
+        authoredPitLease = result.asset;
+        authoredPitCacheKey = result.cacheKey;
+        pitContentsGroup.position.y = AUTHORED_PIT_CONTENT_LIFT;
+        // The irregular opening and collision remain code-owned while Meshy's
+        // PBR surface supplies the authored earth detail. This avoids turning
+        // an excavation into the raised bowl silhouette common to image-to-3D.
+        gameMount.dataset.pitRenderer = "meshy";
+      } catch {
+        // The dark recessed floor and complete procedural excavation remain
+        // visible if the authored file is malformed or cannot be mounted.
+        result.asset.dispose();
+        clearEnvironmentAssetCache(result.cacheKey);
+      }
+    })();
 
     const stoneGeometry = new THREE.DodecahedronGeometry(0.38, 0);
-    const stoneMaterials = [
+    const stoneMaterials: StoneMaterial[] = [
       new THREE.MeshStandardMaterial({ color: 0x8c8b82, roughness: 0.94 }),
       new THREE.MeshStandardMaterial({ color: 0x747873, roughness: 0.96 }),
       new THREE.MeshStandardMaterial({ color: 0xa0927e, roughness: 0.95 }),
       new THREE.MeshStandardMaterial({ color: 0x676b69, roughness: 0.98 }),
     ];
+    let activeStoneGeometry: THREE.BufferGeometry = stoneGeometry;
+    let activeStoneMaterials = stoneMaterials;
 
+    const stoneBedGeometry = new THREE.IcosahedronGeometry(0.42, 1);
+    const stoneBedMaterial = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.98,
+      metalness: 0,
+    });
+    const stoneBedColors = [
+      new THREE.Color(0x5d5a52),
+      new THREE.Color(0x6c6357),
+      new THREE.Color(0x52544f),
+      new THREE.Color(0x756a59),
+      new THREE.Color(0x625b50),
+    ];
     const embeddedGravel = new THREE.InstancedMesh(
-      stoneGeometry,
-      stoneMaterials[2],
-      18,
+      stoneBedGeometry,
+      stoneBedMaterial,
+      PIT_BASE_STONE_COUNT,
     );
     const gravelTransform = new THREE.Object3D();
     for (let index = 0; index < embeddedGravel.count; index += 1) {
       const angle = index * 2.399963229728653;
-      const radius = 0.64 + ((index * 37) % 100) / 100 * (PIT_RADIUS - 1.02);
-      const scale = 0.19 + ((index * 19) % 8) * 0.018;
+      const radius = 0.3 + Math.sqrt(((index * 37) % 101) / 101) * (PIT_RADIUS - 0.72);
+      const scale = 0.72 + ((index * 19) % 9) * 0.026;
       gravelTransform.position.set(
         Math.cos(angle) * radius,
-        -0.72 + (index % 3) * 0.018,
+        -0.66 + (index % 4) * 0.032,
         Math.sin(angle) * radius,
       );
       gravelTransform.rotation.set(angle * 0.31, angle, angle * 0.17);
-      gravelTransform.scale.set(scale * 1.2, scale * 0.62, scale);
+      gravelTransform.scale.set(scale * 1.14, scale * 0.56, scale);
       gravelTransform.updateMatrix();
       embeddedGravel.setMatrixAt(index, gravelTransform.matrix);
+      embeddedGravel.setColorAt(index, stoneBedColors[index % stoneBedColors.length]);
     }
     embeddedGravel.instanceMatrix.needsUpdate = true;
+    if (embeddedGravel.instanceColor) embeddedGravel.instanceColor.needsUpdate = true;
     embeddedGravel.receiveShadow = true;
-    pitGroup.add(embeddedGravel);
+    pitContentsGroup.add(embeddedGravel);
 
     function shapeStone(stone: THREE.Mesh, index: number, generation = 0) {
       const descriptor = getStoneDescriptor(index, generation);
@@ -338,13 +509,14 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     function createStone(index: number, generation = 0) {
       const descriptor = getStoneDescriptor(index, generation);
       const stone = new THREE.Mesh(
-        stoneGeometry,
-        stoneMaterials[descriptor.material],
+        activeStoneGeometry,
+        activeStoneMaterials[descriptor.material],
       );
       shapeStone(stone, index, generation);
       stone.userData.available = true;
       stone.userData.stoneId = descriptor.id;
       stone.userData.generation = generation;
+      stone.userData.stoneIndex = index;
       return stone;
     }
 
@@ -357,15 +529,16 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       rocks.push(stone);
     }
 
-    const pitPileMeshes = stoneMaterials.map((material) => {
-      const mesh = new THREE.InstancedMesh(stoneGeometry, material, 180);
+    const pitPileMeshes: THREE.InstancedMesh<THREE.BufferGeometry, StoneMaterial>[] =
+      stoneMaterials.map((material) => {
+      const mesh = new THREE.InstancedMesh(activeStoneGeometry, material, 180);
       mesh.count = 0;
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       mesh.castShadow = false;
       mesh.receiveShadow = false;
-      pitGroup.add(mesh);
+      pitContentsGroup.add(mesh);
       return mesh;
-    });
+      });
     const pitPileTransform = new THREE.Object3D();
     function reconcilePitPile(nextCount: number) {
       const visibleCount = Math.min(nextCount, 180);
@@ -381,7 +554,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         const lift = Math.max(0, (nextCount / CAPACITY) * 2.25 - radius * 0.18);
         pitPileTransform.position.set(
           Math.cos(angle) * radius,
-          -0.57 + lift,
+          -0.55 + lift,
           Math.sin(angle) * radius,
         );
         pitPileTransform.rotation.set(
@@ -410,6 +583,53 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       }
     }
     reconcilePitPile(storedCount);
+
+    gameMount.dataset.stoneRenderer = "procedural-fallback";
+    void (async () => {
+      const result = await loadEnvironmentAsset(WAITLAND_GAMEPLAY_STONE_ASSET_MANIFEST, {
+        signal: authoredAssetController.signal,
+      });
+      if (!result.ok) return;
+      let geometry: THREE.BufferGeometry | null = null;
+      let materials: StoneMaterial[] | null = null;
+      try {
+        geometry = bakeSinglePrimitiveEnvironmentGeometry(result.asset.template);
+        materials = cloneAuthoredStoneMaterials(result.asset.template.primitives[0].material);
+      } catch {
+        geometry?.dispose();
+        if (materials) disposeStoneMaterials(materials);
+        result.asset.dispose();
+        clearEnvironmentAssetCache(result.cacheKey);
+        return;
+      }
+      if (disposed) {
+        geometry.dispose();
+        disposeStoneMaterials(materials);
+        result.asset.dispose();
+        clearEnvironmentAssetCache(result.cacheKey);
+        return;
+      }
+
+      authoredStoneLease = result.asset;
+      authoredStoneCacheKey = result.cacheKey;
+      authoredStoneGeometry = geometry;
+      authoredStoneMaterials = materials;
+      activeStoneGeometry = geometry;
+      activeStoneMaterials = materials;
+
+      for (const rock of rocks) {
+        const stoneIndex = Math.max(0, Math.trunc(Number(rock.userData.stoneIndex) || 0));
+        const generation = Math.max(0, Math.trunc(Number(rock.userData.generation) || 0));
+        const descriptor = getStoneDescriptor(stoneIndex, generation);
+        rock.geometry = geometry;
+        rock.material = materials[descriptor.material];
+      }
+      for (let index = 0; index < pitPileMeshes.length; index += 1) {
+        pitPileMeshes[index].geometry = geometry;
+        pitPileMeshes[index].material = materials[index];
+      }
+      gameMount.dataset.stoneRenderer = "meshy";
+    })();
 
     const player = new THREE.Group();
     player.position.set(0, 0, 18);
@@ -460,6 +680,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     let nearestRock: THREE.Mesh | null = null;
     let heldRock: THREE.Mesh | null = null;
     let pickupPending = false;
+    let pickupAnimating = false;
     let isThrowing = false;
     let walkTime = 0;
     let activeThrow:
@@ -472,8 +693,23 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           landsInPit: boolean;
           forwardEnd: THREE.Vector3;
           awaitingAuthority: boolean;
+          released: boolean;
+          releaseElapsed: number;
+          releaseTimeout: number;
         }
       | undefined;
+    const remoteThrows = new Map<
+      string,
+      {
+        stone: THREE.Mesh;
+        start: THREE.Vector3;
+        end: THREE.Vector3;
+        elapsed: number;
+        duration: number;
+        landsInPit: boolean;
+        finalState: RealtimeStone;
+      }
+    >();
 
     const worldUp = new THREE.Vector3(0, 1, 0);
     const cameraForward = new THREE.Vector3(0, 0, -1);
@@ -482,6 +718,8 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     const cameraLookTarget = new THREE.Vector3();
     const speechAnchor = new THREE.Vector3();
     const heldRockAnchorPosition = new THREE.Vector3();
+    const heldRockAnchorQuaternion = new THREE.Quaternion();
+    const sceneWorldQuaternion = new THREE.Quaternion();
     const remoteRenderer = new RemoteAvatarRenderer(scene, {
       maxPlayers: 64,
       interpolationDelayMs: 100,
@@ -511,6 +749,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       }
     >();
     const deferredStoneStates = new Map<string, RealtimeStone>();
+    const deferredRemoteStoneStates = new Map<string, RealtimeStone>();
     let selfId = "";
     let sharedWorld = false;
     let multiplayerBlockReason: "replaced" | "incompatible" | null = null;
@@ -722,14 +961,78 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       setOnlineCount(1 + remotePlayers.size);
     }
 
-    function applyStoneState(stoneState: RealtimeStone) {
+    function beginRemoteThrow(
+      stone: THREE.Mesh,
+      stoneState: RealtimeStone,
+      previousGeneration: number,
+      release?: RemoteStoneRelease,
+    ) {
+      const finalState = deferredRemoteStoneStates.get(stoneState.id) ?? stoneState;
+      deferredRemoteStoneStates.delete(stoneState.id);
+      if (!release) {
+        applyStoneState(finalState, { skipRemoteRelease: true });
+        return;
+      }
+
+      scene.updateWorldMatrix(true, false);
+      scene.attach(stone);
+      stone.position.copy(scene.worldToLocal(release.position.clone()));
+      scene.getWorldQuaternion(sceneWorldQuaternion).invert();
+      stone.quaternion.copy(sceneWorldQuaternion).multiply(release.quaternion);
+      stone.visible = true;
+      stone.userData.available = false;
+
+      const nextGeneration = Math.max(0, Math.trunc(finalState.generation ?? previousGeneration));
+      const landsInPit = nextGeneration > previousGeneration;
+      remoteThrows.set(stoneState.id, {
+        stone,
+        start: stone.position.clone(),
+        end: landsInPit
+          ? randomPitLanding()
+          : new THREE.Vector3(finalState.x, 0.3, finalState.z),
+        elapsed: 0,
+        duration: landsInPit ? 0.72 : 0.65,
+        landsInPit,
+        finalState,
+      });
+    }
+
+    function applyStoneState(
+      stoneState: RealtimeStone,
+      options: { skipRemoteRelease?: boolean } = {},
+    ) {
       const stone = rocks.find((candidate) => candidate.userData.stoneId === stoneState.id);
       if (!stone) return;
+      if (remoteThrows.has(stoneState.id) && !options.skipRemoteRelease) {
+        deferredRemoteStoneStates.set(stoneState.id, stoneState);
+        return;
+      }
+      const previousHolderId =
+        typeof stone.userData.authoritativeHolderId === "string"
+          ? stone.userData.authoritativeHolderId
+          : null;
+      const previousGeneration = Math.max(0, Math.trunc(Number(stone.userData.generation) || 0));
+      stone.userData.authoritativeHolderId = stoneState.holderId;
       if (stone === heldRock || stone === activeThrow?.stone) {
         deferredStoneStates.set(stoneState.id, stoneState);
         return;
       }
+      if (
+        !options.skipRemoteRelease &&
+        !stoneState.holderId &&
+        previousHolderId &&
+        previousHolderId !== selfId &&
+        remoteRenderer.deferStoneRelease(previousHolderId, (release) =>
+          beginRemoteThrow(stone, stoneState, previousGeneration, release),
+        )
+      ) {
+        deferredRemoteStoneStates.set(stoneState.id, stoneState);
+        stone.userData.available = false;
+        stone.visible = false;
+        return;
+      }
       deferredStoneStates.delete(stoneState.id);
+      deferredRemoteStoneStates.delete(stoneState.id);
       if (typeof stoneState.generation === "number") {
         const index = Number.parseInt(stoneState.id.replace("stone-", ""), 10);
         const generation = Math.max(0, Math.trunc(stoneState.generation));
@@ -741,7 +1044,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
           descriptor.rotationY,
           descriptor.rotationZ,
         );
-        stone.material = stoneMaterials[descriptor.material];
+        stone.material = activeStoneMaterials[descriptor.material];
       }
       if (stoneState.holderId) {
         stone.userData.available = false;
@@ -760,7 +1063,10 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     ) {
       pendingActions.clear();
       deferredStoneStates.clear();
+      deferredRemoteStoneStates.clear();
+      remoteThrows.clear();
       pickupPending = false;
+      pickupAnimating = false;
       if (activeThrow) {
         scene.attach(activeThrow.stone);
         activeThrow.stone.visible = true;
@@ -806,7 +1112,8 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         activeThrow?.stone === pending.stone
       ) {
         const throwAnimation = activeThrow;
-        const animationHadFinished = throwAnimation.elapsed >= throwAnimation.duration;
+        const animationHadFinished =
+          throwAnimation.released && throwAnimation.elapsed >= throwAnimation.duration;
         const priorEnd = throwAnimation.end.clone();
         if (result.deposited === true) {
           throwAnimation.landsInPit = true;
@@ -834,7 +1141,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       if (!pending) return;
       if (result.ok) {
         if (pending.kind === "pickup" && heldRock === pending.stone) {
-          setMode("throw");
+          if (!pickupAnimating) setMode("throw");
           flashMessage("Take it to the pit");
         }
         if (result.kind === "throw" && result.deposited === false) {
@@ -879,6 +1186,26 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       flashMessage(
         result.reason === "stone-unavailable" ? "Someone got there first" : "Try again",
       );
+    }
+
+    function releaseActiveThrow(stone: THREE.Mesh) {
+      const throwAnimation = activeThrow;
+      if (!throwAnimation || throwAnimation.stone !== stone || throwAnimation.released) return;
+
+      const heldItemAnchor = riggedAvatar?.anchors.heldItem ?? localAvatar.anchors.heldItem;
+      player.updateMatrixWorld(true);
+      heldItemAnchor.getWorldPosition(heldRockAnchorPosition);
+      heldItemAnchor.getWorldQuaternion(heldRockAnchorQuaternion);
+      scene.updateWorldMatrix(true, false);
+      scene.attach(stone);
+      stone.position.copy(scene.worldToLocal(heldRockAnchorPosition));
+      scene.getWorldQuaternion(sceneWorldQuaternion).invert();
+      stone.quaternion.copy(sceneWorldQuaternion).multiply(heldRockAnchorQuaternion);
+
+      throwAnimation.start.copy(stone.position);
+      throwAnimation.elapsed = 0;
+      throwAnimation.released = true;
+      if (heldRock === stone) heldRock = null;
     }
 
     function consumeStoneVisually(stone: THREE.Mesh, respawnLocally = true) {
@@ -1031,7 +1358,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
     realtimeRef.current = realtime;
 
     function performAction() {
-      if (disposed || isThrowing) return;
+      if (disposed || isThrowing || pickupAnimating) return;
       if (multiplayerBlockReason) {
         flashMessage(
           multiplayerBlockReason === "incompatible"
@@ -1055,6 +1382,15 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         player.attach(heldRock);
         heldRock.position.set(0.58, 1.65, -0.28);
         heldRock.rotation.set(0.25, 0.4, 0.1);
+        pickupAnimating =
+          riggedAvatar?.playInteraction({
+            kind: "pickup",
+            restart: true,
+            onComplete: () => {
+              pickupAnimating = false;
+              if (heldRock && !pickupPending && !isThrowing) setMode("throw");
+            },
+          }) ?? false;
         if (actionId) {
           pickupPending = true;
           pendingActions.set(actionId, {
@@ -1063,7 +1399,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
             originalPosition,
           });
         }
-        setMode(pickupPending ? "none" : "throw");
+        setMode(pickupPending || pickupAnimating ? "none" : "throw");
         flashMessage(pickupPending ? "Picking it up…" : "Take it to the pit");
         return;
       }
@@ -1078,12 +1414,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         flashMessage("Reconnecting…");
         return;
       }
-      heldRock = null;
       isThrowing = true;
-      riggedAvatar?.playInteraction({ restart: true });
-      scene.attach(stone);
-
-      const start = stone.position.clone();
       const distance = Math.hypot(player.position.x, player.position.z);
       const closeEnoughToPit = distance <= PIT_THROW_RADIUS;
       const forwardLanding = getForwardStonePosition(
@@ -1098,19 +1429,30 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
 
       activeThrow = {
         stone,
-        start,
+        start: new THREE.Vector3(),
         end,
         elapsed: 0,
         duration: closeEnoughToPit ? 0.72 : 0.62,
         landsInPit: closeEnoughToPit,
         forwardEnd,
         awaitingAuthority: Boolean(actionId),
+        released: false,
+        releaseElapsed: 0,
+        releaseTimeout: 0.2,
       };
+      const throwPlayed =
+        riggedAvatar?.playInteraction({
+          kind: "throw",
+          restart: true,
+          onRelease: () => releaseActiveThrow(stone),
+          onComplete: () => releaseActiveThrow(stone),
+        }) ?? false;
+      activeThrow.releaseTimeout = throwPlayed ? 0.95 : 0.2;
       if (actionId) {
         pendingActions.set(actionId, {
           kind: "throw",
           stone,
-          originalPosition: start.clone(),
+          originalPosition: stone.position.clone(),
         });
       }
       setMode("none");
@@ -1205,7 +1547,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         (keys.has("KeyS") || keys.has("ArrowDown") ? 1 : 0);
       const inputX = clamp(keyX + joystickInput.current.x, -1, 1);
       const inputY = clamp(keyY + joystickInput.current.y, -1, 1);
-      const inputLength = Math.hypot(inputX, inputY);
+      const inputLength = isThrowing || pickupAnimating ? 0 : Math.hypot(inputX, inputY);
 
       if (inputLength > 0.08) {
         if (!movedOnce) {
@@ -1303,7 +1645,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         rock.visible = deltaX * deltaX + deltaZ * deltaZ <= STONE_RENDER_DISTANCE_SQUARED;
       }
 
-      if (multiplayerBlockReason) setMode("none");
+      if (multiplayerBlockReason || isThrowing || pickupAnimating) setMode("none");
       else if (heldRock && !pickupPending) setMode("throw");
       else if (heldRock) setMode("none");
       else if (nearestRock && nearestDistance <= 1.85) setMode("pickup");
@@ -1311,6 +1653,15 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       if (nearestDistance > 1.85 && !heldRock) nearestRock = null;
 
       if (activeThrow) {
+        if (!activeThrow.released) {
+          activeThrow.releaseElapsed += dt;
+          if (activeThrow.releaseElapsed >= activeThrow.releaseTimeout) {
+            releaseActiveThrow(activeThrow.stone);
+          }
+        }
+      }
+
+      if (activeThrow?.released) {
         activeThrow.elapsed += dt;
         const t = clamp(activeThrow.elapsed / activeThrow.duration, 0, 1);
         activeThrow.stone.position.lerpVectors(activeThrow.start, activeThrow.end, t);
@@ -1334,6 +1685,22 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
         }
       }
 
+      for (const [stoneId, throwAnimation] of remoteThrows) {
+        throwAnimation.elapsed += dt;
+        const t = clamp(throwAnimation.elapsed / throwAnimation.duration, 0, 1);
+        throwAnimation.stone.position.lerpVectors(throwAnimation.start, throwAnimation.end, t);
+        throwAnimation.stone.position.y +=
+          Math.sin(t * Math.PI) * (throwAnimation.landsInPit ? 3.5 : 2.3);
+        throwAnimation.stone.rotation.x += dt * 8;
+        throwAnimation.stone.rotation.z += dt * 5;
+        if (t < 1) continue;
+
+        const finalState = deferredRemoteStoneStates.get(stoneId) ?? throwAnimation.finalState;
+        remoteThrows.delete(stoneId);
+        deferredRemoteStoneStates.delete(stoneId);
+        applyStoneState(finalState, { skipRemoteRelease: true });
+      }
+
       const pitDistance = Math.max(
         0,
         Math.round(Math.hypot(player.position.x, player.position.z) - PIT_WALL_RADIUS),
@@ -1347,9 +1714,9 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       const outwardX = player.position.x / distanceFromPit;
       const outwardZ = player.position.z / distanceFromPit;
       desiredCameraPosition.set(
-        player.position.x + outwardX * 18,
-        player.position.y + 12,
-        player.position.z + outwardZ * 18,
+        player.position.x + outwardX * 18.2,
+        player.position.y + 11.6,
+        player.position.z + outwardZ * 18.2,
       );
       camera.position.lerp(desiredCameraPosition, 1 - Math.pow(0.001, dt));
       // Keep the pit and path in the composition while placing the hero in the
@@ -1358,7 +1725,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       const lookAhead = Math.min(distanceFromPit * 0.5, 12);
       cameraLookTarget.set(
         player.position.x - outwardX * lookAhead,
-        1.8,
+        1.15,
         player.position.z - outwardZ * lookAhead,
       );
       camera.lookAt(cameraLookTarget);
@@ -1405,6 +1772,7 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       respawnTimers.clear();
       if (speechTimerRef.current) clearTimeout(speechTimerRef.current);
       riggedAvatarController.abort();
+      authoredAssetController.abort();
       realtime.destroy();
       if (realtimeRef.current === realtime) realtimeRef.current = null;
       remoteRenderer.dispose();
@@ -1417,9 +1785,21 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       window.removeEventListener("pagehide", onPageHide);
       document.removeEventListener("visibilitychange", onVisibilityChange);
       storybookWorld.dispose();
+      authoredPitLease?.dispose();
+      authoredStoneGeometry?.dispose();
+      if (authoredStoneMaterials) disposeStoneMaterials(authoredStoneMaterials);
+      authoredStoneLease?.dispose();
+      clearEnvironmentAssetCache(authoredPitCacheKey);
+      clearEnvironmentAssetCache(authoredStoneCacheKey);
       pitTextureBinding.dispose();
+      pitTurfTextureBinding.dispose();
+      embeddedGravel.dispose();
+      stoneBedGeometry.dispose();
+      stoneBedMaterial.dispose();
+      pitClods.dispose();
+      pitPileMeshes.forEach((mesh) => mesh.dispose());
       stoneGeometry.dispose();
-      stoneMaterials.forEach((material) => material.dispose());
+      disposeStoneMaterials(stoneMaterials);
       pitFloorGeometry.dispose();
       pitFloorMaterial.dispose();
       pitWallGeometry.dispose();
@@ -1427,6 +1807,8 @@ export default function WaitingPit({ profile, onEditProfile }: WaitingPitProps) 
       pitLipGeometry.dispose();
       pitClodGeometry.dispose();
       pitLipMaterial.dispose();
+      pitTurfGeometry.dispose();
+      pitTurfMaterial.dispose();
       riggedAvatar?.dispose();
       localAvatar.dispose();
       renderer?.dispose();

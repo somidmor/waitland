@@ -1,4 +1,10 @@
 import * as THREE from "three";
+import type {
+  EnvironmentAssetLease,
+  EnvironmentInstancedPool,
+} from "./environment/environment-asset-runtime.ts";
+import { loadEnvironmentAsset } from "./environment/environment-asset-runtime.ts";
+import { WAITLAND_ENVIRONMENT_MANIFEST } from "./environment/environment-manifest.ts";
 import {
   PIT_EDGE_SEGMENTS,
   PIT_LIP_OUTER_PHASE,
@@ -235,13 +241,23 @@ const WORLD_CHUNK_RADIUS = 3;
 const WORLD_CHUNK_DIAMETER = WORLD_CHUNK_RADIUS * 2 + 1;
 const WORLD_CHUNK_COUNT = WORLD_CHUNK_DIAMETER * WORLD_CHUNK_DIAMETER;
 const PIT_MEADOW_CLEARANCE = PIT_LIP_OUTER_RADIUS + 0.2;
+const CENTRAL_PIT_OPENING_SCALE = 0.94;
 
 const PATCHES_PER_CHUNK = 3;
-const GRASS_MARKS_PER_CHUNK = 72;
-const FLOWERS_PER_CHUNK = 8;
+const GRASS_MARKS_PER_CHUNK = 480;
+const FLOWERS_PER_CHUNK = 22;
 const TREES_PER_CHUNK = 1;
-const BUSHES_PER_CHUNK = 1;
+const BUSHES_PER_CHUNK = 2;
 const ROCKS_PER_CHUNK = 2;
+
+const AUTHORED_PATH_MODULES = 15;
+
+type AuthoredEnvironmentKey = keyof typeof WAITLAND_ENVIRONMENT_MANIFEST.assets;
+
+type InstalledEnvironmentAsset = {
+  lease: EnvironmentAssetLease;
+  pool: EnvironmentInstancedPool;
+};
 
 function mixSeed(value: number) {
   let next = value | 0;
@@ -273,7 +289,9 @@ export function createCentralMeadowGeometry() {
 
   const opening = new THREE.Path();
   opening.moveTo(
-    pitEdgeRadius(0, PIT_LIP_OUTER_RADIUS, PIT_LIP_OUTER_PHASE) * 1.035,
+    pitEdgeRadius(0, PIT_LIP_OUTER_RADIUS, PIT_LIP_OUTER_PHASE) *
+      1.035 *
+      CENTRAL_PIT_OPENING_SCALE,
     0,
   );
   for (let index = 1; index <= PIT_EDGE_SEGMENTS; index += 1) {
@@ -284,7 +302,10 @@ export function createCentralMeadowGeometry() {
       PIT_LIP_OUTER_RADIUS,
       PIT_LIP_OUTER_PHASE,
     );
-    opening.lineTo(Math.cos(angle) * radius * 1.035, Math.sin(angle) * radius);
+    opening.lineTo(
+      Math.cos(angle) * radius * 1.035 * CENTRAL_PIT_OPENING_SCALE,
+      Math.sin(angle) * radius * CENTRAL_PIT_OPENING_SCALE,
+    );
   }
   opening.closePath();
   shape.holes.push(opening);
@@ -315,12 +336,39 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
   root.name = "storybook-world";
   scene.add(root);
 
+  const authoredRoot = new THREE.Group();
+  authoredRoot.name = "authored-environment-v2";
+  root.add(authoredRoot);
+  const authoredAssets: Partial<
+    Record<AuthoredEnvironmentKey, InstalledEnvironmentAsset>
+  > = {};
+  const environmentAbort = new AbortController();
+  let worldDisposed = false;
+
   const disposable = new Set<Disposable>();
   const remember = <T extends Disposable>(value: T) => {
     disposable.add(value);
     return value;
   };
   const transform = new THREE.Object3D();
+
+  const setAuthoredInstance = (
+    pool: EnvironmentInstancedPool,
+    index: number,
+    x: number,
+    y: number,
+    z: number,
+    scaleX: number,
+    scaleY: number,
+    scaleZ: number,
+    rotationY = 0,
+  ) => {
+    transform.position.set(x, y, z);
+    transform.scale.set(scaleX, scaleY, scaleZ);
+    transform.rotation.set(0, rotationY, 0);
+    transform.updateMatrix();
+    pool.setMatrixAt(index, transform.matrix);
+  };
 
   const groundGeometry = remember(
     new THREE.PlaneGeometry(WORLD_CHUNK_SIZE + 0.12, WORLD_CHUNK_SIZE + 0.12),
@@ -350,14 +398,14 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
 
   remember(
     attachEnvironmentMaterialTextures(
-      [{ material: groundMaterial, texturedColor: 0xcbd6aa }],
+      [{ material: groundMaterial, texturedColor: 0xe6e3c1 }],
       ENVIRONMENT_TEXTURE_PATHS.grass,
       { repeat: 14, normalScale: 0.24 },
     ),
   );
 
-  // This is a faint foot-worn trail, not a road. Meadow marks are allowed
-  // close to its edges so the route feels partially reclaimed by grass.
+  // The reference trail is broad enough to read at phone scale, but its soft
+  // edges and meadow detail keep it feeling walked-in rather than paved.
   const pathPoints = [
     new THREE.Vector3(-2.8, 0, 48),
     new THREE.Vector3(-1.7, 0, 35),
@@ -369,22 +417,22 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
     new THREE.Vector3(2.1, 0, -17.2),
     new THREE.Vector3(0.2, 0, -28),
   ];
-  const pathWidths = [0.82, 0.74, 0.68, 0.62, 0.58, 0.58, 0.64, 0.72, 0.84];
+  const pathWidths = [1.42, 1.3, 1.16, 1.03, 0.96, 1, 1.1, 1.25, 1.42];
   const pathCurve = new THREE.CatmullRomCurve3(pathPoints, false, "centripetal");
   const pathSamples = Array.from({ length: 72 }, (_, index) =>
     pathCurve.getPointAt(index / 71),
   );
 
   const pathEdgeGeometry = remember(
-    makePathRibbonGeometry(pathCurve, pathWidths, 1.28, 0.008, false),
+    makePathRibbonGeometry(pathCurve, pathWidths, 1.22, 0.008, false),
   );
   const pathEdgeMaterial = remember(
     new THREE.MeshStandardMaterial({
-      color: 0x756343,
+      color: 0x6f5b3d,
       roughness: 1,
       metalness: 0,
       transparent: true,
-      opacity: 0.065,
+      opacity: 0.1,
       depthWrite: false,
     }),
   );
@@ -402,13 +450,46 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
       metalness: 0,
       vertexColors: true,
       transparent: true,
-      opacity: 0.15,
+      opacity: 0.42,
       depthWrite: false,
     }),
   );
   const path = new THREE.Mesh(pathGeometry, pathMaterial);
   path.receiveShadow = true;
   root.add(path);
+
+  const pathWidthAt = (t: number) => {
+    const widthPosition = THREE.MathUtils.clamp(t, 0, 1) * (pathWidths.length - 1);
+    const widthIndex = Math.min(pathWidths.length - 2, Math.floor(widthPosition));
+    return THREE.MathUtils.lerp(
+      pathWidths[widthIndex],
+      pathWidths[widthIndex + 1],
+      widthPosition - widthIndex,
+    );
+  };
+
+  const populateAuthoredPath = (pool: EnvironmentInstancedPool) => {
+    const point = new THREE.Vector3();
+    const tangent = new THREE.Vector3();
+    for (let index = 0; index < AUTHORED_PATH_MODULES; index += 1) {
+      const t = (index + 0.5) / AUTHORED_PATH_MODULES;
+      pathCurve.getPointAt(t, point);
+      pathCurve.getTangentAt(t, tangent);
+      const widthScale = pathWidthAt(t) / 1.1;
+      setAuthoredInstance(
+        pool,
+        index,
+        point.x,
+        -0.1,
+        point.z,
+        1.08,
+        1,
+        widthScale * 0.52,
+        Math.atan2(-tangent.z, tangent.x),
+      );
+    }
+    pool.commit(AUTHORED_PATH_MODULES);
+  };
 
   const pointForChunk = (
     chunkX: number,
@@ -467,13 +548,14 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
         "position",
         new THREE.Float32BufferAttribute(
           [
-            -0.07, 0, 0, 0.07, 0, 0, 0.045, 0.5, 0, -0.045, 0.5, 0,
-            0, 0, -0.07, 0, 0, 0.07, 0, 0.5, 0.045, 0, 0.5, -0.045,
+            -0.05, 0, 0, 0.05, 0, 0, 0, 0.34, 0,
+            0, 0, -0.05, 0, 0, 0.05, 0, 0.34, 0,
+            -0.036, 0, -0.036, 0.036, 0, 0.036, 0, 0.3, 0,
           ],
           3,
         ),
       )
-      .setIndex([0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]),
+      .setIndex([0, 1, 2, 3, 4, 5, 6, 7, 8]),
   );
   grassGeometry.computeVertexNormals();
   const grassMaterial = remember(
@@ -482,7 +564,7 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
       roughness: 1,
       side: THREE.DoubleSide,
       transparent: true,
-      opacity: 0.66,
+      opacity: 0.6,
       alphaTest: 0.08,
       depthWrite: false,
     }),
@@ -494,10 +576,10 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
   );
   grass.frustumCulled = false;
   const grassColors = [
-    new THREE.Color(0x69773f),
-    new THREE.Color(0x7d8549),
-    new THREE.Color(0x909354),
-    new THREE.Color(0xa6a061),
+    new THREE.Color(0x687941),
+    new THREE.Color(0x7c8c49),
+    new THREE.Color(0x91a052),
+    new THREE.Color(0xa7a264),
   ];
   root.add(grass);
 
@@ -594,6 +676,11 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
     let trunkIndex = 0;
     let foliageIndex = 0;
     let rockIndex = 0;
+    let authoredGrassIndex = 0;
+    let authoredFlowerIndex = 0;
+    let authoredTreeIndex = 0;
+    let authoredShrubIndex = 0;
+    let authoredRockIndex = 0;
 
     for (
       let chunkZ = nextChunkZ - WORLD_CHUNK_RADIUS;
@@ -605,6 +692,15 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
         chunkX <= nextChunkX + WORLD_CHUNK_RADIUS;
         chunkX += 1
       ) {
+        const chunkLodDistance = Math.max(
+          Math.abs(chunkX - nextChunkX),
+          Math.abs(chunkZ - nextChunkZ),
+        );
+        const authoredNear = (asset: AuthoredEnvironmentKey) =>
+          Boolean(authoredAssets[asset]) &&
+          chunkLodDistance <=
+            WAITLAND_ENVIRONMENT_MANIFEST.assets[asset].placement.authoredChunkRadius;
+
         if (chunkX !== 0 || chunkZ !== 0) {
           setInstance(
             groundTiles,
@@ -650,6 +746,9 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
         }
 
         const grassRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x6ba7));
+        const useAuthoredGrass = authoredNear("grass");
+        // Cheap crossed blades remain beneath the authored clusters. They are
+        // what makes the near field continuous instead of a few isolated props.
         for (let slot = 0; slot < GRASS_MARKS_PER_CHUNK; slot += 1) {
           const point = pointForChunk(
             chunkX,
@@ -679,7 +778,41 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
           grassIndex += 1;
         }
 
+        const authoredGrass = authoredAssets.grass?.pool;
+        if (authoredGrass && useAuthoredGrass) {
+          const clusterRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x6bb9));
+          for (
+            let slot = 0;
+            slot < WAITLAND_ENVIRONMENT_MANIFEST.assets.grass.placement.instancesPerChunk;
+            slot += 1
+          ) {
+            const point = pointForChunk(
+              chunkX,
+              chunkZ,
+              clusterRandom,
+              PIT_LIP_OUTER_RADIUS - 0.12,
+              0.12,
+            );
+            if (!point.visible) continue;
+            const size = 0.78 + clusterRandom() * 0.5;
+            setAuthoredInstance(
+              authoredGrass,
+              authoredGrassIndex,
+              point.x,
+              0.012,
+              point.z,
+              size * (0.88 + clusterRandom() * 0.22),
+              size * (0.82 + clusterRandom() * 0.32),
+              size * (0.88 + clusterRandom() * 0.22),
+              clusterRandom() * Math.PI * 2,
+            );
+            authoredGrassIndex += 1;
+          }
+        }
+
         const flowerRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x8de1));
+        const useAuthoredFlowers = authoredNear("flowers");
+        // Tiny procedural blooms fill the gaps between Meshy flower accents.
         for (let slot = 0; slot < FLOWERS_PER_CHUNK; slot += 1) {
           const point = pointForChunk(
             chunkX,
@@ -707,114 +840,210 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
           flowerIndex += 1;
         }
 
+        const authoredFlowers = authoredAssets.flowers?.pool;
+        if (authoredFlowers && useAuthoredFlowers) {
+          const clusterRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x8df7));
+          for (
+            let slot = 0;
+            slot < WAITLAND_ENVIRONMENT_MANIFEST.assets.flowers.placement.instancesPerChunk;
+            slot += 1
+          ) {
+            const point = pointForChunk(
+              chunkX,
+              chunkZ,
+              clusterRandom,
+              PIT_LIP_OUTER_RADIUS + 0.42,
+              0.78,
+            );
+            if (!point.visible) continue;
+            const size = 0.72 + clusterRandom() * 0.38;
+            setAuthoredInstance(
+              authoredFlowers,
+              authoredFlowerIndex,
+              point.x,
+              0.016,
+              point.z,
+              size,
+              size * (0.88 + clusterRandom() * 0.22),
+              size,
+              clusterRandom() * Math.PI * 2,
+            );
+            authoredFlowerIndex += 1;
+          }
+        }
+
         const treeRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0xa4c3));
+        const useAuthoredTrees = authoredNear("tree");
         for (let slot = 0; slot < TREES_PER_CHUNK; slot += 1) {
           const tree = pointForChunk(chunkX, chunkZ, treeRandom, 18, 2.4);
           const treeVisible = tree.visible && treeRandom() > 0.44;
           const size = treeVisible ? 0.78 + treeRandom() * 0.64 : 0;
           const rotation = treeRandom() * Math.PI;
-          setInstance(
-            trunks,
-            trunkIndex,
-            transform,
-            tree.x,
-            size * 0.7,
-            tree.z,
-            size * 0.9,
-            size,
-            size * 0.9,
-            rotation,
-          );
-          trunkIndex += 1;
+          if (!useAuthoredTrees) {
+            setInstance(
+              trunks,
+              trunkIndex,
+              transform,
+              tree.x,
+              size * 0.7,
+              tree.z,
+              size * 0.9,
+              size,
+              size * 0.9,
+              rotation,
+            );
+            trunkIndex += 1;
 
-          setInstance(
-            foliage,
-            foliageIndex,
-            transform,
-            tree.x - size * 0.16,
-            size * 1.48,
-            tree.z,
-            size * 0.82,
-            size * 0.72,
-            size * 0.78,
-            rotation,
-          );
-          foliage.setColorAt(
-            foliageIndex,
-            foliageColors[Math.floor(treeRandom() * foliageColors.length)],
-          );
-          foliageIndex += 1;
-          setInstance(
-            foliage,
-            foliageIndex,
-            transform,
-            tree.x + size * 0.18,
-            size * 2.02,
-            tree.z - size * 0.06,
-            size * 0.62,
-            size * 0.66,
-            size * 0.6,
-            rotation + 0.7,
-          );
-          foliage.setColorAt(
-            foliageIndex,
-            foliageColors[Math.floor(treeRandom() * foliageColors.length)],
-          );
-          foliageIndex += 1;
+            setInstance(
+              foliage,
+              foliageIndex,
+              transform,
+              tree.x - size * 0.16,
+              size * 1.48,
+              tree.z,
+              size * 0.82,
+              size * 0.72,
+              size * 0.78,
+              rotation,
+            );
+            foliage.setColorAt(
+              foliageIndex,
+              foliageColors[Math.floor(treeRandom() * foliageColors.length)],
+            );
+            foliageIndex += 1;
+            setInstance(
+              foliage,
+              foliageIndex,
+              transform,
+              tree.x + size * 0.18,
+              size * 2.02,
+              tree.z - size * 0.06,
+              size * 0.62,
+              size * 0.66,
+              size * 0.6,
+              rotation + 0.7,
+            );
+            foliage.setColorAt(
+              foliageIndex,
+              foliageColors[Math.floor(treeRandom() * foliageColors.length)],
+            );
+            foliageIndex += 1;
+          }
+
+          const authoredTrees = authoredAssets.tree?.pool;
+          if (authoredTrees && useAuthoredTrees && treeVisible) {
+            setAuthoredInstance(
+              authoredTrees,
+              authoredTreeIndex,
+              tree.x,
+              0.008,
+              tree.z,
+              size * (0.88 + treeRandom() * 0.16),
+              size,
+              size * (0.88 + treeRandom() * 0.16),
+              rotation,
+            );
+            authoredTreeIndex += 1;
+          }
         }
 
         const bushRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0xc271));
+        const useAuthoredShrubs = authoredNear("shrubs");
         for (let slot = 0; slot < BUSHES_PER_CHUNK; slot += 1) {
           const bush = pointForChunk(chunkX, chunkZ, bushRandom, 13, 1.6);
           const bushVisible = bush.visible && bushRandom() > 0.3;
           const size = bushVisible ? 0.42 + bushRandom() * 0.58 : 0;
-          setInstance(
-            foliage,
-            foliageIndex,
-            transform,
-            bush.x,
-            size * 0.58,
-            bush.z,
-            size * (1.15 + bushRandom() * 0.35),
-            size * (0.7 + bushRandom() * 0.28),
-            size,
-            bushRandom() * Math.PI,
-          );
-          foliage.setColorAt(
-            foliageIndex,
-            foliageColors[Math.floor(bushRandom() * foliageColors.length)],
-          );
-          foliageIndex += 1;
+          const stretchX = 1.15 + bushRandom() * 0.35;
+          const stretchY = 0.7 + bushRandom() * 0.28;
+          const rotation = bushRandom() * Math.PI;
+          if (!useAuthoredShrubs) {
+            setInstance(
+              foliage,
+              foliageIndex,
+              transform,
+              bush.x,
+              size * 0.58,
+              bush.z,
+              size * stretchX,
+              size * stretchY,
+              size,
+              rotation,
+            );
+            foliage.setColorAt(
+              foliageIndex,
+              foliageColors[Math.floor(bushRandom() * foliageColors.length)],
+            );
+            foliageIndex += 1;
+          }
+
+          const authoredShrubs = authoredAssets.shrubs?.pool;
+          if (authoredShrubs && useAuthoredShrubs && bushVisible) {
+            setAuthoredInstance(
+              authoredShrubs,
+              authoredShrubIndex,
+              bush.x,
+              0.01,
+              bush.z,
+              size * (0.94 + bushRandom() * 0.22),
+              size * (0.82 + bushRandom() * 0.28),
+              size * (0.94 + bushRandom() * 0.22),
+              rotation,
+            );
+            authoredShrubIndex += 1;
+          }
         }
 
         const rockRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0xe913));
+        const useAuthoredRocks = authoredNear("rocks");
         for (let slot = 0; slot < ROCKS_PER_CHUNK; slot += 1) {
           const rock = pointForChunk(chunkX, chunkZ, rockRandom, 13.5, 1.7);
           const rockVisible = rock.visible && rockRandom() > 0.26;
           const size = rockVisible ? 0.42 + rockRandom() * 0.94 : 0;
-          transform.position.set(rock.x, size * 0.19, rock.z);
-          transform.scale.set(
-            size * (0.75 + rockRandom() * 0.45),
-            size * 0.62,
-            size,
-          );
-          transform.rotation.set(
-            rockRandom() * 1.2,
-            rockRandom() * Math.PI,
-            rockRandom() * 1.2,
-          );
-          transform.updateMatrix();
-          decorativeRocks.setMatrixAt(rockIndex, transform.matrix);
-          decorativeRocks.setColorAt(
-            rockIndex,
-            decorativeRockColors[Math.floor(rockRandom() * decorativeRockColors.length)],
-          );
-          rockIndex += 1;
+          const stretchX = 0.75 + rockRandom() * 0.45;
+          const rotationX = rockRandom() * 1.2;
+          const rotationY = rockRandom() * Math.PI;
+          const rotationZ = rockRandom() * 1.2;
+          if (!useAuthoredRocks) {
+            transform.position.set(rock.x, size * 0.19, rock.z);
+            transform.scale.set(size * stretchX, size * 0.62, size);
+            transform.rotation.set(rotationX, rotationY, rotationZ);
+            transform.updateMatrix();
+            decorativeRocks.setMatrixAt(rockIndex, transform.matrix);
+            decorativeRocks.setColorAt(
+              rockIndex,
+              decorativeRockColors[
+                Math.floor(rockRandom() * decorativeRockColors.length)
+              ],
+            );
+            rockIndex += 1;
+          }
+
+          const authoredRocks = authoredAssets.rocks?.pool;
+          if (authoredRocks && useAuthoredRocks && rockVisible) {
+            setAuthoredInstance(
+              authoredRocks,
+              authoredRockIndex,
+              rock.x,
+              0.01,
+              rock.z,
+              size * stretchX,
+              size * (0.78 + rockRandom() * 0.2),
+              size * (0.9 + rockRandom() * 0.2),
+              rotationY,
+            );
+            authoredRockIndex += 1;
+          }
         }
       }
     }
 
     groundTiles.count = groundIndex;
+    patches.count = patchIndex;
+    grass.count = grassIndex;
+    flowers.count = flowerIndex;
+    trunks.count = trunkIndex;
+    foliage.count = foliageIndex;
+    decorativeRocks.count = rockIndex;
     refreshInstances(groundTiles);
     refreshInstances(patches, true);
     refreshInstances(grass, true);
@@ -822,133 +1051,75 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
     refreshInstances(trunks);
     refreshInstances(foliage, true);
     refreshInstances(decorativeRocks, true);
+    authoredAssets.grass?.pool.commit(authoredGrassIndex);
+    authoredAssets.flowers?.pool.commit(authoredFlowerIndex);
+    authoredAssets.tree?.pool.commit(authoredTreeIndex);
+    authoredAssets.shrubs?.pool.commit(authoredShrubIndex);
+    authoredAssets.rocks?.pool.commit(authoredRockIndex);
   };
 
-  // The horizon is a camera-relative scenic layer. It follows the traveller,
-  // so fixed world coordinates never reveal a perimeter or an empty edge.
+  // Retain a travelling horizon anchor for the streaming contract, but leave
+  // it free of spherical hills/clouds. The portrait raster plate now supplies
+  // that depth without opaque domes obscuring its painted skyline.
   const horizonRoot = new THREE.Group();
   horizonRoot.name = "travelling-horizon";
   root.add(horizonRoot);
-
-  const horizonRandom = seededRandom(0x48ab129d);
-  const hillGeometry = remember(new THREE.SphereGeometry(1, 18, 9));
-  const hillMaterial = remember(
-    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 }),
-  );
-  const hills = new THREE.InstancedMesh(hillGeometry, hillMaterial, 24);
-  const nearHillColors = [
-    new THREE.Color(0x777946),
-    new THREE.Color(0x85834a),
-    new THREE.Color(0x938952),
-  ];
-  const farHillColors = [
-    new THREE.Color(0xa49561),
-    new THREE.Color(0x9a8e5d),
-    new THREE.Color(0xab9a68),
-  ];
-  for (let index = 0; index < hills.count; index += 1) {
-    const far = index >= hills.count / 2;
-    const layerIndex = far ? index - hills.count / 2 : index;
-    const angle = (layerIndex / (hills.count / 2)) * Math.PI * 2 + (far ? 0.31 : 0.07);
-    const radius = far ? 108 + (layerIndex % 3) * 5 : 79 + (layerIndex % 3) * 4;
-    setInstance(
-      hills,
-      index,
-      transform,
-      Math.cos(angle) * radius,
-      far ? -2.4 : -3.1,
-      Math.sin(angle) * radius,
-      (far ? 20 : 13) + horizonRandom() * (far ? 13 : 10),
-      (far ? 6.8 : 4.5) + horizonRandom() * (far ? 4.2 : 3.1),
-      (far ? 15 : 10) + horizonRandom() * (far ? 10 : 8),
-      horizonRandom() * Math.PI,
-    );
-    const palette = far ? farHillColors : nearHillColors;
-    hills.setColorAt(index, palette[layerIndex % palette.length]);
-  }
-  hills.instanceMatrix.needsUpdate = true;
-  hills.instanceColor!.needsUpdate = true;
-  hills.receiveShadow = true;
-  hills.frustumCulled = false;
-  horizonRoot.add(hills);
-
-  const cloudGeometry = remember(new THREE.SphereGeometry(1, 12, 8));
-  const hazeMaterial = remember(
-    new THREE.MeshBasicMaterial({
-      color: 0xe7bf83,
-      transparent: true,
-      opacity: 0.14,
-      depthWrite: false,
-      fog: true,
-    }),
-  );
-  const haze = new THREE.InstancedMesh(cloudGeometry, hazeMaterial, 12);
-  haze.frustumCulled = false;
-  for (let index = 0; index < haze.count; index += 1) {
-    const cluster = Math.floor(index / 2);
-    const petal = index % 2;
-    const angle = (cluster / 6) * Math.PI * 2 + 0.44;
-    const radius = 86 + petal * 6;
-    setInstance(
-      haze,
-      index,
-      transform,
-      Math.cos(angle) * radius - Math.sin(angle) * (petal - 0.5) * 9,
-      4.1 + (cluster % 3) * 0.75,
-      Math.sin(angle) * radius + Math.cos(angle) * (petal - 0.5) * 9,
-      10 + (cluster % 2) * 3,
-      1.45 + petal * 0.5,
-      4.5 + (cluster % 3),
-      -angle,
-    );
-  }
-  haze.instanceMatrix.needsUpdate = true;
-  haze.renderOrder = -3;
-  horizonRoot.add(haze);
-
-  const cloudMaterial = remember(
-    new THREE.MeshBasicMaterial({
-      color: 0xffe9bd,
-      transparent: true,
-      opacity: 0.52,
-      depthWrite: false,
-      fog: true,
-    }),
-  );
-  const clouds = new THREE.InstancedMesh(cloudGeometry, cloudMaterial, 24);
-  clouds.frustumCulled = false;
-  for (let index = 0; index < clouds.count; index += 1) {
-    const cluster = Math.floor(index / 4);
-    const petal = index % 4;
-    const angle = (cluster / 6) * Math.PI * 2 + 0.18;
-    const radius = 82 + (cluster % 2) * 7;
-    const size = 1.75 + ((cluster + petal) % 3) * 0.62;
-    const tangentOffset = (petal - 1.5) * 2.15;
-    setInstance(
-      clouds,
-      index,
-      transform,
-      Math.cos(angle) * radius - Math.sin(angle) * tangentOffset,
-      13.5 + (petal % 2) * 1.05 + (cluster % 3) * 0.36,
-      Math.sin(angle) * radius + Math.cos(angle) * tangentOffset,
-      size * 1.58,
-      size,
-      size,
-      -angle,
-    );
-  }
-  clouds.instanceMatrix.needsUpdate = true;
-  clouds.renderOrder = -2;
-  horizonRoot.add(clouds);
 
   refreshChunks(0, 0);
   centerChunkX = 0;
   centerChunkZ = 0;
 
-  const cloudBaseY = clouds.position.y;
-  const hazeBaseY = haze.position.y;
+  const installAuthoredAsset = async (key: AuthoredEnvironmentKey) => {
+    const manifest = WAITLAND_ENVIRONMENT_MANIFEST.assets[key];
+    const result = await loadEnvironmentAsset(manifest, {
+      signal: environmentAbort.signal,
+    });
+    if (!result.ok) return;
+    if (worldDisposed) {
+      result.asset.dispose();
+      return;
+    }
+
+    const capacity =
+      key === "path"
+        ? AUTHORED_PATH_MODULES
+        : WORLD_CHUNK_COUNT * manifest.placement.instancesPerChunk;
+    const pool = result.asset.createInstancedPool(
+      capacity,
+      `authored-${manifest.assetId}`,
+    );
+    authoredAssets[key] = { lease: result.asset, pool };
+    authoredRoot.add(pool.root);
+
+    if (key === "path") {
+      populateAuthoredPath(pool);
+      for (const mesh of pool.meshes) {
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const material of materials) {
+          material.transparent = true;
+          material.opacity = 0.28;
+          material.depthWrite = false;
+          material.needsUpdate = true;
+        }
+      }
+      // Keep the broad ribbon as the readable trail silhouette. The authored
+      // modules add tactile soil and pebble detail without turning it into a
+      // pair of narrow raised seams.
+      return;
+    }
+    refreshChunks(centerChunkX, centerChunkZ);
+  };
+
+  if (typeof document !== "undefined") {
+    for (const key of Object.keys(
+      WAITLAND_ENVIRONMENT_MANIFEST.assets,
+    ) as AuthoredEnvironmentKey[]) {
+      void installAuthoredAsset(key);
+    }
+  }
+
   return {
-    update(elapsedSeconds, playerX = 0, playerZ = 0) {
+    update(_elapsedSeconds, playerX = 0, playerZ = 0) {
       const safeX = Number.isFinite(playerX) ? playerX : 0;
       const safeZ = Number.isFinite(playerZ) ? playerZ : 0;
       const nextChunkX = chunkAt(safeX);
@@ -960,12 +1131,15 @@ export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
       }
 
       horizonRoot.position.set(safeX, 0, safeZ);
-      clouds.position.y = cloudBaseY + Math.sin(elapsedSeconds * 0.16) * 0.16;
-      clouds.rotation.y = Math.sin(elapsedSeconds * 0.025) * 0.006;
-      haze.position.y = hazeBaseY + Math.sin(elapsedSeconds * 0.1 + 0.8) * 0.08;
-      haze.rotation.y = -Math.sin(elapsedSeconds * 0.018) * 0.004;
     },
     dispose() {
+      worldDisposed = true;
+      environmentAbort.abort();
+      for (const installed of Object.values(authoredAssets)) {
+        authoredRoot.remove(installed.pool.root);
+        installed.pool.dispose();
+        installed.lease.dispose();
+      }
       scene.remove(root);
       disposable.forEach((item) => item.dispose());
     },

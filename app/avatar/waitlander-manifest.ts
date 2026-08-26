@@ -8,20 +8,39 @@ import type { RiggedAvatarManifest } from "./rigged-avatar-runtime.ts";
 export const WAITLANDER_RUNTIME_MANIFEST = {
   schemaVersion: 1,
   assetId: "waitlander-base",
-  assetVersion: "1.0.0+3900935e",
-  url: "/assets/avatars/v1/waitlander-runtime.glb",
+  assetVersion: "2.0.0+1864100b",
+  url: "/assets/avatars/v2/waitlander-runtime.glb",
   animations: {
     walk: ["walking_man", "walking"],
     idle: ["|Idle|", "idle"],
+    pickup: [
+      "Male_Bend_Over_Pick_Up",
+      "pickup",
+      "Female_Crouch_Pick_Throw_Forward",
+    ],
+    throw: [
+      "Waitland_Professional_Overarm_Throw",
+      "professional_overarm_throw",
+      "Female_Crouch_Pick_Throw_Forward",
+    ],
     interact: ["Female_Crouch_Pick_Throw_Forward", "pick_throw"],
-    fadeSeconds: 0.16,
+    // Pickup still uses the opening of the legacy combined clip. Throw resolves
+    // to the dedicated Meshy Prime motion included in the v2 runtime.
+    pickupFallbackSegment: [0, 0.42],
+    throwFallbackSegment: [0.38, 1],
+    fadeSeconds: 0.1,
     walkTimeScale: 0.92,
+    pickupTimeScale: 2.2,
+    throwTimeScale: 2.2,
     interactTimeScale: 4.5,
+    pickupContactProgress: 0.58,
+    throwReleaseProgress: 0.365,
+    inPlaceInteractions: true,
     lockScale: true,
     rebaseHips: true,
   },
   normalization: {
-    targetHeight: 3.05,
+    targetHeight: 3.78,
     centerXZ: true,
     ground: true,
     sourceForward: "+z",

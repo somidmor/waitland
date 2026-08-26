@@ -146,6 +146,14 @@ export function isNearPitStonePosition(x: number, z: number) {
   return radius >= PIT_WALL_RADIUS && radius <= NEAR_PIT_STONE_RADIUS;
 }
 
+/** Heading whose gameplay -Z forward axis points from a world pose to the pit. */
+export function headingTowardPit(x: number, z: number) {
+  const finiteX = Number.isFinite(x) ? x : 0;
+  const finiteZ = Number.isFinite(z) ? z : 18;
+  if (Math.hypot(finiteX, finiteZ) < 0.001) return 0;
+  return Math.atan2(finiteX, finiteZ);
+}
+
 /**
  * Shared landing prediction for a non-deposited throw. The server captures the
  * action-time pose and the browser uses the same calculation, so an async pit

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import * as THREE from "three";
 import { WAITLANDER_RUNTIME_MANIFEST } from "../app/avatar/waitlander-manifest.ts";
 
 const ASSET_URL = new URL(
-  "../public/assets/avatars/v1/waitlander-runtime.glb",
+  "../public/assets/avatars/v2/waitlander-runtime.glb",
   import.meta.url,
 );
 
@@ -25,6 +26,12 @@ async function readGlbJson() {
 test("production avatar is a compact single-mesh mobile GLB", async () => {
   const { file, json } = await readGlbJson();
   assert.ok(file.byteLength < 1_100_000, "avatar must stay below the 1.1 MB budget");
+  const checksum = createHash("sha256").update(file).digest("hex");
+  assert.equal(
+    WAITLANDER_RUNTIME_MANIFEST.assetVersion,
+    `2.0.0+${checksum.slice(0, 8)}`,
+    "manifest version must include the shipped GLB checksum",
+  );
   assert.equal(json.meshes?.length, 1);
   assert.equal(json.materials?.length, 1);
   assert.equal(json.images?.length, 1);
@@ -46,6 +53,47 @@ test("production avatar contains the rig and all required motion clips", async (
   assert.ok(animationNames.some((name) => /pick.*throw/i.test(name)));
 });
 
+test("v2 avatar and manifest select the scale-safe professional throw", async () => {
+  const { json } = await readGlbJson();
+  const professionalThrow = json.animations?.find(
+    (animation) => animation.name === "Waitland_Professional_Overarm_Throw",
+  );
+  assert.ok(professionalThrow, "v2 must contain the dedicated Meshy Prime throw");
+  assert.ok(
+    professionalThrow.channels.every((channel) => channel.target.path !== "scale"),
+    "the professional throw must preserve the canonical bind scale",
+  );
+  assert.equal(professionalThrow.channels.length, 23);
+
+  assert.equal(WAITLANDER_RUNTIME_MANIFEST.url, "/assets/avatars/v2/waitlander-runtime.glb");
+  assert.match(String(WAITLANDER_RUNTIME_MANIFEST.assetVersion), /^2\.0\.0\+/);
+  assert.equal(WAITLANDER_RUNTIME_MANIFEST.animations.throw[0], professionalThrow.name);
+  assert.equal(WAITLANDER_RUNTIME_MANIFEST.animations.throwTimeScale, 2.2);
+  assert.equal(WAITLANDER_RUNTIME_MANIFEST.animations.throwReleaseProgress, 0.365);
+  assert.equal(WAITLANDER_RUNTIME_MANIFEST.animations.pickupTimeScale, 2.2);
+  const professionalDuration = json.accessors[
+    professionalThrow.samplers[0].input
+  ].max[0];
+  const throwPlaybackSeconds =
+    professionalDuration / WAITLANDER_RUNTIME_MANIFEST.animations.throwTimeScale;
+  assert.ok(
+    throwPlaybackSeconds > 1.3 && throwPlaybackSeconds < 1.4,
+    `professional throw should play in about 1.35s, got ${throwPlaybackSeconds}`,
+  );
+
+  const pickupSource = json.animations.find((animation) => /pick.*throw/i.test(animation.name));
+  assert.ok(pickupSource);
+  const pickupSourceDuration = json.accessors[pickupSource.samplers[0].input].max[0];
+  const [, pickupEnd] = WAITLANDER_RUNTIME_MANIFEST.animations.pickupFallbackSegment;
+  const pickupFrames = Math.ceil(pickupEnd * pickupSourceDuration * 30);
+  const pickupPlaybackSeconds =
+    pickupFrames / 30 / WAITLANDER_RUNTIME_MANIFEST.animations.pickupTimeScale;
+  assert.ok(
+    pickupPlaybackSeconds > 0.9 && pickupPlaybackSeconds < 1,
+    `fallback pickup should play in 0.9–1.0s, got ${pickupPlaybackSeconds}`,
+  );
+});
+
 function readFloatAccessor(file, json, accessorIndex) {
   const accessor = json.accessors[accessorIndex];
   const view = json.bufferViews[accessor.bufferView];
@@ -61,6 +109,32 @@ function readFloatAccessor(file, json, accessorIndex) {
     ),
   );
 }
+
+test("every production avatar animation sampler has strictly increasing times", async () => {
+  const { file, json } = await readGlbJson();
+  let samplerCount = 0;
+  for (const [animationIndex, animation] of (json.animations ?? []).entries()) {
+    for (const [samplerIndex, sampler] of (animation.samplers ?? []).entries()) {
+      const times = readFloatAccessor(file, json, sampler.input).map(([time]) => time);
+      assert.ok(times.length > 0, "animation time accessors must not be empty");
+      for (let index = 0; index < times.length; index += 1) {
+        assert.ok(
+          Number.isFinite(times[index]),
+          `${animation.name ?? animationIndex} sampler ${samplerIndex} has a non-finite time`,
+        );
+        if (index > 0) {
+          assert.ok(
+            times[index] > times[index - 1],
+            `${animation.name ?? animationIndex} sampler ${samplerIndex} repeats or reverses ` +
+              `time at sample ${index}: ${times[index - 1]} -> ${times[index]}`,
+          );
+        }
+      }
+      samplerCount += 1;
+    }
+  }
+  assert.ok(samplerCount > 0, "production avatar must contain animation samplers");
+});
 
 function nodeWorldPosition(json, nodeName) {
   const objects = json.nodes.map((node) => {

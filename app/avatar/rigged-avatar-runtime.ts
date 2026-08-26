@@ -6,11 +6,14 @@ import { clone as cloneSkeletonSafe } from "three/examples/jsm/utils/SkeletonUti
 export const RIGGED_AVATAR_MANIFEST_SCHEMA_VERSION = 1 as const;
 
 export type RiggedAvatarClipSelector = string | readonly string[];
+export type RiggedAvatarInteractionKind = "pickup" | "throw" | "interact";
 export type RiggedAvatarAnimationSlot =
   | "idle"
   | "walk"
   | "carryIdle"
   | "carryWalk"
+  | "pickup"
+  | "throw"
   | "interact";
 export type RiggedAvatarActiveAnimation = RiggedAvatarAnimationSlot | "rest";
 
@@ -56,11 +59,24 @@ export type RiggedAvatarManifest = {
     idle?: RiggedAvatarClipSelector;
     carryIdle?: RiggedAvatarClipSelector;
     carryWalk?: RiggedAvatarClipSelector;
-    /** Optional one-shot pickup/throw or similar interaction clip. */
+    /** Dedicated one-shots. The legacy interact clip remains a compatibility fallback. */
+    pickup?: RiggedAvatarClipSelector;
+    throw?: RiggedAvatarClipSelector;
+    /** Optional legacy pickup/throw or similar interaction clip. */
     interact?: RiggedAvatarClipSelector;
+    /** Normalized legacy-clip ranges used only when a dedicated clip is unavailable. */
+    pickupFallbackSegment?: readonly [number, number];
+    throwFallbackSegment?: readonly [number, number];
     fadeSeconds?: number;
     walkTimeScale?: number;
+    pickupTimeScale?: number;
+    throwTimeScale?: number;
     interactTimeScale?: number;
+    /** The hand-contact/release beats within the selected one-shot. */
+    pickupContactProgress?: number;
+    throwReleaseProgress?: number;
+    /** Defaults to true so authored one-shots cannot drag the model away from gameplay. */
+    inPlaceInteractions?: boolean;
     /**
      * Removes authored scale keyframes from every selected clip. Enable this
      * when animations were combined from separately normalized versions of the
@@ -103,10 +119,25 @@ export type RiggedAvatarMotion = {
 };
 
 export type RiggedAvatarInteractionOptions = {
+  kind?: RiggedAvatarInteractionKind;
   timeScale?: number;
   fadeSeconds?: number;
+  /** Overrides the manifest's contact/release beat for this play. */
+  markerProgress?: number;
+  onMarker?: (event: RiggedAvatarInteractionEvent) => void;
+  /** Called at the release beat for throw interactions, after anchors are synchronized. */
+  onRelease?: (event: RiggedAvatarInteractionEvent) => void;
+  onComplete?: (event: RiggedAvatarInteractionEvent) => void;
   /** An interaction already in progress is ignored unless restart is true. */
   restart?: boolean;
+};
+
+export type RiggedAvatarInteractionEvent = {
+  kind: RiggedAvatarInteractionKind;
+  /** Normalized action time after playback speed has been applied. */
+  progress: number;
+  /** The animated hand-held-item anchor at this exact evaluated frame. */
+  heldItem: THREE.Group;
 };
 
 export type RiggedAvatarLoader = Pick<GLTFLoader, "loadAsync">;
@@ -143,6 +174,8 @@ export type RiggedAvatarRuntime = {
   }>;
   readonly normalizedHeight: number;
   readonly activeAnimation: RiggedAvatarActiveAnimation;
+  readonly activeInteraction: RiggedAvatarInteractionKind | null;
+  readonly interactionProgress: number;
   readonly motion: Readonly<Required<RiggedAvatarMotion>>;
   setMotion: (motion: RiggedAvatarMotion, fadeSeconds?: number) => void;
   /** Returns false when the manifest has no interaction clip or one is already active. */
@@ -295,6 +328,27 @@ function findClip(
   return undefined;
 }
 
+function normalizedSubclip(
+  clip: THREE.AnimationClip,
+  name: string,
+  segment: readonly [number, number] | undefined,
+) {
+  if (!segment) return clip;
+  const start = clamp(segment[0], 0, 1);
+  const end = clamp(segment[1], 0, 1);
+  if (!(end > start) || !(clip.duration > 0)) return clip;
+  // Meshy animation exports are sampled densely. Thirty frames per second
+  // keeps their authored keys intact while producing an independent one-shot.
+  const fps = 30;
+  return THREE.AnimationUtils.subclip(
+    clip,
+    name,
+    Math.floor(start * clip.duration * fps),
+    Math.ceil(end * clip.duration * fps),
+    fps,
+  );
+}
+
 /** Resolves clip aliases without mutating the cached GLTF animations. */
 export function resolveRiggedAvatarClips(
   animations: readonly THREE.AnimationClip[],
@@ -308,12 +362,30 @@ export function resolveRiggedAvatarClips(
     );
   }
 
+  const interact = findClip(animations, manifest.animations.interact);
+  const pickupSource = findClip(animations, manifest.animations.pickup) ?? interact;
+  const throwSource = findClip(animations, manifest.animations.throw) ?? interact;
+
   return {
     walk,
     idle: findClip(animations, manifest.animations.idle, DEFAULT_IDLE_CLIPS),
     carryIdle: findClip(animations, manifest.animations.carryIdle),
     carryWalk: findClip(animations, manifest.animations.carryWalk),
-    interact: findClip(animations, manifest.animations.interact),
+    pickup: pickupSource
+      ? normalizedSubclip(
+          pickupSource,
+          `${pickupSource.name}:pickup`,
+          pickupSource === interact ? manifest.animations.pickupFallbackSegment : undefined,
+        )
+      : undefined,
+    throw: throwSource
+      ? normalizedSubclip(
+          throwSource,
+          `${throwSource.name}:throw`,
+          throwSource === interact ? manifest.animations.throwFallbackSegment : undefined,
+        )
+      : undefined,
+    interact,
   };
 }
 
@@ -351,6 +423,28 @@ function rebaseHipsPositionTrack(track: THREE.KeyframeTrack, hips: THREE.Bone) {
   }
 }
 
+function lockHipsHorizontalPositionTrack(track: THREE.KeyframeTrack, hips: THREE.Bone) {
+  let binding: ReturnType<typeof THREE.PropertyBinding.parseTrackName>;
+  try {
+    binding = THREE.PropertyBinding.parseTrackName(track.name);
+  } catch {
+    return;
+  }
+  const targetName = binding.nodeName?.split("/").at(-1);
+  const namesHips =
+    normalizedName(targetName ?? "") === normalizedName(hips.name) ||
+    normalizedName(binding.objectIndex ?? "") === normalizedName(hips.name);
+  const valueSize = track.getValueSize();
+  if (binding.propertyName !== "position" || !namesHips || valueSize < 3) return;
+
+  const x = Number(track.values[0]);
+  const z = Number(track.values[2]);
+  for (let offset = 0; offset < track.values.length; offset += valueSize) {
+    track.values[offset] = x;
+    track.values[offset + 2] = z;
+  }
+}
+
 /**
  * Returns per-runtime clips with scale animation removed when requested. The
  * decoded GLTF clips stay immutable and can remain shared in the loader cache.
@@ -360,15 +454,17 @@ export function prepareRiggedAvatarClips(
   manifest: RiggedAvatarManifest,
   hips?: THREE.Bone,
 ): RiggedAvatarResolvedClips {
-  if (!manifest.animations.lockScale && !(manifest.animations.rebaseHips && hips)) {
+  const inPlaceInteractions = manifest.animations.inPlaceInteractions !== false;
+  if (
+    !manifest.animations.lockScale &&
+    !(manifest.animations.rebaseHips && hips) &&
+    !(inPlaceInteractions && hips && (clips.pickup || clips.throw || clips.interact))
+  ) {
     return clips;
   }
 
-  const stabilized = new Map<THREE.AnimationClip, THREE.AnimationClip>();
-  const prepareClip = (clip: THREE.AnimationClip | undefined) => {
+  const prepareClip = (clip: THREE.AnimationClip | undefined, inPlace = false) => {
     if (!clip) return undefined;
-    const cached = stabilized.get(clip);
-    if (cached) return cached;
     const clone = clip.clone();
     if (manifest.animations.lockScale) {
       clone.tracks = clone.tracks.filter((track) => !isScaleTrack(track));
@@ -376,7 +472,9 @@ export function prepareRiggedAvatarClips(
     if (manifest.animations.rebaseHips && hips) {
       for (const track of clone.tracks) rebaseHipsPositionTrack(track, hips);
     }
-    stabilized.set(clip, clone);
+    if (inPlace && inPlaceInteractions && hips) {
+      for (const track of clone.tracks) lockHipsHorizontalPositionTrack(track, hips);
+    }
     return clone;
   };
 
@@ -385,12 +483,26 @@ export function prepareRiggedAvatarClips(
     idle: prepareClip(clips.idle),
     carryIdle: prepareClip(clips.carryIdle),
     carryWalk: prepareClip(clips.carryWalk),
-    interact: prepareClip(clips.interact),
+    pickup: prepareClip(clips.pickup, true),
+    throw: prepareClip(clips.throw, true),
+    interact: prepareClip(clips.interact, true),
   };
 }
 
 function validSelector(selector: unknown) {
   return selectorValues(selector).length > 0;
+}
+
+function validNormalizedSegment(value: unknown) {
+  return (
+    Array.isArray(value) &&
+    value.length === 2 &&
+    Number.isFinite(value[0]) &&
+    Number.isFinite(value[1]) &&
+    value[0] >= 0 &&
+    value[1] <= 1 &&
+    value[1] > value[0]
+  );
 }
 
 function validateManifest(manifest: RiggedAvatarManifest) {
@@ -418,6 +530,33 @@ function validateManifest(manifest: RiggedAvatarManifest) {
     !validSelector(manifest.animations.walk)
   ) {
     return "The rigged-avatar manifest needs at least one walk animation alias.";
+  }
+  for (const slot of ["pickup", "throw", "interact"] as const) {
+    const selector = manifest.animations[slot];
+    if (selector !== undefined && !validSelector(selector)) {
+      return `animations.${slot} must contain at least one clip alias when supplied.`;
+    }
+  }
+  for (const field of ["pickupFallbackSegment", "throwFallbackSegment"] as const) {
+    const segment = manifest.animations[field];
+    if (segment !== undefined && !validNormalizedSegment(segment)) {
+      return `animations.${field} must be an increasing normalized [start, end] pair.`;
+    }
+  }
+  for (const field of ["walkTimeScale", "pickupTimeScale", "throwTimeScale", "interactTimeScale"] as const) {
+    const timeScale = manifest.animations[field];
+    if (timeScale !== undefined && (!Number.isFinite(timeScale) || !(timeScale > 0))) {
+      return `animations.${field} must be positive when supplied.`;
+    }
+  }
+  for (const field of ["pickupContactProgress", "throwReleaseProgress"] as const) {
+    const progress = manifest.animations[field];
+    if (
+      progress !== undefined &&
+      (!Number.isFinite(progress) || !(progress > 0) || !(progress < 1))
+    ) {
+      return `animations.${field} must be between zero and one when supplied.`;
+    }
   }
   const targetHeight = manifest.normalization?.targetHeight;
   if (
@@ -728,13 +867,22 @@ function instantiateRuntime(
     const runtimeClips = prepareRiggedAvatarClips(clips, manifest, bones.hips);
     const mixer = new THREE.AnimationMixer(cloned);
     const actions: Partial<Record<RiggedAvatarAnimationSlot, THREE.AnimationAction>> = {};
-    for (const slot of ["idle", "walk", "carryIdle", "carryWalk", "interact"] as const) {
+    for (const slot of [
+      "idle",
+      "walk",
+      "carryIdle",
+      "carryWalk",
+      "pickup",
+      "throw",
+      "interact",
+    ] as const) {
       const clip = runtimeClips[slot];
       if (!clip) continue;
+      const oneShot = slot === "pickup" || slot === "throw" || slot === "interact";
       // A dedicated clip object prevents an accidental alias from changing a
       // looping locomotion action into LoopOnce.
-      const action = mixer.clipAction(slot === "interact" ? clip.clone() : clip, cloned);
-      if (slot === "interact") {
+      const action = mixer.clipAction(oneShot ? clip.clone() : clip, cloned);
+      if (oneShot) {
         action.setLoop(THREE.LoopOnce, 1);
         action.clampWhenFinished = true;
       } else {
@@ -760,6 +908,19 @@ function instantiateRuntime(
     let activeAnimation: RiggedAvatarActiveAnimation = "rest";
     let activeAction: THREE.AnimationAction | undefined;
     let interactionPlaying = false;
+    let interactionFinished = false;
+    let interactionProgress = 0;
+    let interactionState:
+      | {
+          kind: RiggedAvatarInteractionKind;
+          action: THREE.AnimationAction;
+          markerProgress: number;
+          markerFired: boolean;
+          onMarker?: RiggedAvatarInteractionOptions["onMarker"];
+          onRelease?: RiggedAvatarInteractionOptions["onRelease"];
+          onComplete?: RiggedAvatarInteractionOptions["onComplete"];
+        }
+      | undefined;
     let motion: Required<RiggedAvatarMotion> = {
       moving: options.initialMotion?.moving ?? false,
       speed: options.initialMotion?.speed ?? 0,
@@ -827,12 +988,25 @@ function instantiateRuntime(
     }
 
     function playInteraction(options: RiggedAvatarInteractionOptions = {}) {
-      if (disposed || !actions.interact) return false;
+      const kind = options.kind ?? "interact";
+      const requestedAction =
+        kind === "pickup"
+          ? actions.pickup ?? actions.interact
+          : kind === "throw"
+            ? actions.throw ?? actions.interact
+            : actions.interact;
+      if (disposed || !requestedAction) return false;
       if (interactionPlaying && !options.restart) return false;
 
-      const interaction = actions.interact;
+      const interaction = requestedAction;
       const fade = clamp(options.fadeSeconds ?? manifest.animations.fadeSeconds ?? 0.18, 0, 2);
-      const configuredTimeScale = options.timeScale ?? manifest.animations.interactTimeScale;
+      const configuredTimeScale =
+        options.timeScale ??
+        (kind === "pickup"
+          ? manifest.animations.pickupTimeScale
+          : kind === "throw"
+            ? manifest.animations.throwTimeScale
+            : manifest.animations.interactTimeScale);
       const timeScale =
         typeof configuredTimeScale === "number" &&
         Number.isFinite(configuredTimeScale) &&
@@ -850,15 +1024,33 @@ function instantiateRuntime(
         .play();
       interaction.clampWhenFinished = true;
       activeAction = interaction;
-      activeAnimation = "interact";
+      activeAnimation = kind;
       interactionPlaying = true;
+      interactionFinished = false;
+      interactionProgress = 0;
+      const defaultMarkerProgress =
+        kind === "pickup"
+          ? manifest.animations.pickupContactProgress ?? 0.6
+          : kind === "throw"
+            ? manifest.animations.throwReleaseProgress ?? 0.54
+            : 0.54;
+      interactionState = {
+        kind,
+        action: interaction,
+        markerProgress: clamp(options.markerProgress ?? defaultMarkerProgress, 0.05, 0.95),
+        markerFired: false,
+        onMarker: options.onMarker,
+        onRelease: options.onRelease,
+        onComplete: options.onComplete,
+      };
       return true;
     }
 
     function handleMixerFinished(event: { action: THREE.AnimationAction }) {
-      if (disposed || !interactionPlaying || event.action !== actions.interact) return;
-      interactionPlaying = false;
-      transitionToMotion(manifest.animations.fadeSeconds ?? 0.18);
+      if (disposed || !interactionPlaying || event.action !== interactionState?.action) return;
+      // Finish only after this frame's evaluated hand transform has propagated
+      // to the public anchors. This keeps a release callback on the exact pose.
+      interactionFinished = true;
     }
 
     mixer.addEventListener("finished", handleMixerFinished);
@@ -933,6 +1125,38 @@ function instantiateRuntime(
       );
     }
 
+    function interactionEvent(
+      state: NonNullable<typeof interactionState>,
+      progress: number,
+    ): RiggedAvatarInteractionEvent {
+      return {
+        kind: state.kind,
+        progress,
+        heldItem: heldItemAnchor,
+      };
+    }
+
+    function updateInteractionBeat() {
+      const state = interactionState;
+      if (!interactionPlaying || !state) return;
+      const duration = Math.max(0.0001, state.action.getClip().duration);
+      interactionProgress = clamp(state.action.time / duration, 0, 1);
+      if (!state.markerFired && (interactionProgress >= state.markerProgress || interactionFinished)) {
+        state.markerFired = true;
+        const event = interactionEvent(state, Math.max(interactionProgress, state.markerProgress));
+        state.onMarker?.(event);
+        if (state.kind === "throw") state.onRelease?.(event);
+      }
+      if (!interactionFinished) return;
+
+      interactionProgress = 1;
+      interactionPlaying = false;
+      interactionFinished = false;
+      interactionState = undefined;
+      state.onComplete?.(interactionEvent(state, 1));
+      transitionToMotion(manifest.animations.fadeSeconds ?? 0.18);
+    }
+
     function update(deltaSeconds: number, nextMotion?: RiggedAvatarMotion) {
       if (disposed) return;
       removeAppliedPosture();
@@ -941,6 +1165,7 @@ function instantiateRuntime(
       applyPosture();
       cloned.updateMatrixWorld(true);
       syncAnchors();
+      updateInteractionBeat();
     }
 
     function dispose() {
@@ -948,6 +1173,8 @@ function instantiateRuntime(
       disposed = true;
       removeAppliedPosture();
       interactionPlaying = false;
+      interactionFinished = false;
+      interactionState = undefined;
       mixer.removeEventListener("finished", handleMixerFinished);
       mixer.stopAllAction();
       mixer.uncacheRoot(cloned);
@@ -978,6 +1205,12 @@ function instantiateRuntime(
       normalizedHeight,
       get activeAnimation() {
         return activeAnimation;
+      },
+      get activeInteraction() {
+        return interactionState?.kind ?? null;
+      },
+      get interactionProgress() {
+        return interactionProgress;
       },
       get motion() {
         return motion;

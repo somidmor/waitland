@@ -14,6 +14,8 @@ import { WAITLANDER_RUNTIME_MANIFEST } from "./avatar/waitlander-manifest.ts";
 
 export const MAX_REMOTE_PLAYERS = 64;
 const DEPARTURE_DURATION_MS = 2_650;
+const RIGGED_LOAD_RETRY_BASE_MS = 600;
+const RIGGED_LOAD_RETRY_MAX_MS = 15_000;
 
 export interface RemotePlayerProfile {
   name: string;
@@ -78,6 +80,11 @@ export interface RemoteAvatarRendererOptions {
 
 export type RemoteOverlayCallback = (anchors: readonly RemoteAvatarAnchor[]) => void;
 export type RemoteAvatarRenderMode = "procedural" | "loading" | "rigged";
+export type RemoteStoneRelease = {
+  position: THREE.Vector3;
+  quaternion: THREE.Quaternion;
+};
+export type RemoteStoneReleaseCallback = (release?: RemoteStoneRelease) => void;
 export type RemoteRiggedAvatarLoader = (
   manifest: RiggedAvatarManifest,
   options: RiggedAvatarLoadOptions,
@@ -128,8 +135,16 @@ interface RemotePlayerState {
   anchor: RemoteAvatarAnchor;
   riggedWanted: boolean;
   riggedFailed: boolean;
+  riggedRetryAttempt: number;
+  riggedRetryAt: number;
   riggedLoadController?: AbortController;
   riggedAvatar?: RiggedAvatarRuntime;
+  /** Last authoritative carrying state already presented by the animator. */
+  presentedCarryingStone: boolean;
+  /** Keeps the remote stone on the animated hand until the throw release beat. */
+  interactionHoldingStone: boolean;
+  interactionReleaseDeadline?: number;
+  pendingStoneReleases: Set<RemoteStoneReleaseCallback>;
 }
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -321,6 +336,7 @@ export class RemoteAvatarRenderer {
   private readonly riggedManifest: RiggedAvatarManifest;
 
   private clockOffsetMs: number | undefined;
+  private riggedRetryClockMs = performance.now();
   private disposed = false;
 
   private readonly rootMatrix = new THREE.Matrix4();
@@ -488,6 +504,11 @@ export class RemoteAvatarRenderer {
         },
         riggedWanted: false,
         riggedFailed: false,
+        riggedRetryAttempt: 0,
+        riggedRetryAt: 0,
+        presentedCarryingStone: Boolean(snapshot.carryingStone),
+        interactionHoldingStone: false,
+        pendingStoneReleases: new Set(),
       };
       this.players.set(snapshot.id, state);
     }
@@ -558,6 +579,25 @@ export class RemoteAvatarRenderer {
     return this.deletePlayer(id);
   }
 
+  /**
+   * Defers an authoritative world-stone placement until this remote's animated
+   * hand reaches its throw release beat. Returns false when no authored remote
+   * can present the action, allowing the caller to apply the state immediately.
+   */
+  deferStoneRelease(id: string, callback: RemoteStoneReleaseCallback) {
+    const state = this.players.get(id);
+    if (
+      !state ||
+      state.departureAt !== undefined ||
+      !state.riggedAvatar ||
+      (!state.presentedCarryingStone && !state.interactionHoldingStone)
+    ) {
+      return false;
+    }
+    state.pendingStoneReleases.add(callback);
+    return true;
+  }
+
   setSpeech(id: string, speech: string, expiresAt?: number) {
     const state = this.players.get(id);
     if (!state || state.departureAt !== undefined) return false;
@@ -588,11 +628,12 @@ export class RemoteAvatarRenderer {
   ) {
     if (this.disposed) return;
     const now = Number.isFinite(nowMs) ? nowMs : performance.now();
+    this.riggedRetryClockMs = now;
     const dt = clamp(deltaSeconds, 0, 0.1);
     const renderAt = now - this.interpolationDelayMs;
     const width = Math.max(1, viewport.width);
     const height = Math.max(1, viewport.height);
-    this.selectRiggedPlayers(camera, localPosition, viewport);
+    this.selectRiggedPlayers(now, camera, localPosition, viewport);
     // Individual rigged roots do not participate in the instanced count reset,
     // so hide first and reveal only avatars that pass this frame's culling.
     for (const state of this.players.values()) {
@@ -655,16 +696,53 @@ export class RemoteAvatarRenderer {
         riggedAvatar.root.position.copy(this.tempPosition);
         riggedAvatar.root.quaternion.copy(this.rootQuaternion);
         riggedAvatar.root.scale.setScalar(exitScale);
-        const wasCarrying = riggedAvatar.motion.carryingStone;
-        if (wasCarrying && !pose.carryingStone && !departing) {
-          riggedAvatar.playInteraction();
+        if (
+          state.interactionHoldingStone &&
+          state.interactionReleaseDeadline !== undefined &&
+          now >= state.interactionReleaseDeadline
+        ) {
+          state.interactionHoldingStone = false;
+          state.interactionReleaseDeadline = undefined;
+          this.flushStoneReleases(state);
+        }
+        if (state.presentedCarryingStone !== pose.carryingStone && !departing) {
+          if (pose.carryingStone) {
+            this.flushStoneReleases(state);
+            state.interactionHoldingStone = false;
+            state.interactionReleaseDeadline = undefined;
+            riggedAvatar.playInteraction({ kind: "pickup", restart: true });
+          } else {
+            const releasePresentedStone = (event?: { heldItem: THREE.Group }) => {
+              if (this.players.get(state.id) !== state) return;
+              state.interactionHoldingStone = false;
+              state.interactionReleaseDeadline = undefined;
+              this.flushStoneReleases(state, event?.heldItem);
+            };
+            state.interactionHoldingStone = riggedAvatar.playInteraction({
+              kind: "throw",
+              restart: true,
+              onRelease: releasePresentedStone,
+              onComplete: releasePresentedStone,
+            });
+            if (state.interactionHoldingStone) {
+              // Defensive fallback for malformed/missing mixer completion events.
+              state.interactionReleaseDeadline = now + 950;
+            } else {
+              this.flushStoneReleases(state);
+            }
+          }
+          state.presentedCarryingStone = pose.carryingStone;
         }
         riggedAvatar.update(dt, {
           moving: walking,
           speed: clamp(speed / 5.5, 0, 1),
-          carryingStone: pose.carryingStone,
+          carryingStone: pose.carryingStone || state.interactionHoldingStone,
         });
         riggedAvatar.anchors.speech.getWorldPosition(this.projected).project(camera);
+      } else {
+        state.presentedCarryingStone = pose.carryingStone;
+        state.interactionHoldingStone = false;
+        state.interactionReleaseDeadline = undefined;
       }
 
       const avatarRootMatrix = this.rootMatrix;
@@ -779,7 +857,11 @@ export class RemoteAvatarRenderer {
         detailCount += 1;
       }
 
-      if (detailed && pose.carryingStone && !departing) {
+      if (
+        detailed &&
+        (pose.carryingStone || state.interactionHoldingStone) &&
+        !departing
+      ) {
         const spin = now * 0.0006;
         this.setPart(
           this.stones,
@@ -917,6 +999,7 @@ export class RemoteAvatarRenderer {
   }
 
   private selectRiggedPlayers(
+    nowMs: number,
     camera: THREE.Camera,
     localPosition: Pick<THREE.Vector3, "x" | "z">,
     viewport: RemoteViewport,
@@ -953,19 +1036,33 @@ export class RemoteAvatarRenderer {
     candidates.sort((left, right) => left.priorityDistance - right.priorityDistance);
     const selected = new Set(candidates.slice(0, budget).map(({ state }) => state.id));
     for (const state of this.players.values()) {
-      this.setRiggedWanted(state, selected.has(state.id));
+      this.setRiggedWanted(state, selected.has(state.id), nowMs);
     }
   }
 
-  private setRiggedWanted(state: RemotePlayerState, wanted: boolean) {
+  private setRiggedWanted(state: RemotePlayerState, wanted: boolean, nowMs: number) {
     if (!wanted) {
       this.releaseRiggedPlayer(state);
       return;
     }
     state.riggedWanted = true;
-    if (!state.riggedAvatar && !state.riggedLoadController && !state.riggedFailed) {
+    if (
+      !state.riggedAvatar &&
+      !state.riggedLoadController &&
+      !state.riggedFailed &&
+      nowMs >= state.riggedRetryAt
+    ) {
       this.beginRiggedLoad(state);
     }
+  }
+
+  private scheduleRiggedLoadRetry(state: RemotePlayerState) {
+    state.riggedRetryAttempt += 1;
+    const delayMs = Math.min(
+      RIGGED_LOAD_RETRY_MAX_MS,
+      RIGGED_LOAD_RETRY_BASE_MS * 2 ** Math.min(5, state.riggedRetryAttempt - 1),
+    );
+    state.riggedRetryAt = this.riggedRetryClockMs + delayMs;
   }
 
   private beginRiggedLoad(state: RemotePlayerState) {
@@ -994,7 +1091,11 @@ export class RemoteAvatarRenderer {
         }
         state.riggedLoadController = undefined;
         if (!result.ok) {
-          if (result.reason !== "aborted") state.riggedFailed = true;
+          if (result.reason === "load-failed") {
+            this.scheduleRiggedLoadRetry(state);
+          } else if (result.reason !== "aborted") {
+            state.riggedFailed = true;
+          }
           return;
         }
         if (
@@ -1012,11 +1113,14 @@ export class RemoteAvatarRenderer {
         result.avatar.root.visible = false;
         this.riggedRoot.add(result.avatar.root);
         state.riggedAvatar = result.avatar;
+        state.riggedFailed = false;
+        state.riggedRetryAttempt = 0;
+        state.riggedRetryAt = 0;
       })
       .catch(() => {
         if (state.riggedLoadController !== controller) return;
         state.riggedLoadController = undefined;
-        if (!controller.signal.aborted) state.riggedFailed = true;
+        if (!controller.signal.aborted) this.scheduleRiggedLoadRetry(state);
       });
   }
 
@@ -1027,9 +1131,26 @@ export class RemoteAvatarRenderer {
       state.riggedLoadController = undefined;
     }
     if (state.riggedAvatar) {
+      this.flushStoneReleases(state, state.riggedAvatar.anchors.heldItem);
       state.riggedAvatar.dispose();
       state.riggedAvatar = undefined;
     }
+  }
+
+  private flushStoneReleases(state: RemotePlayerState, heldItem?: THREE.Group) {
+    if (state.pendingStoneReleases.size === 0) return;
+    const anchor = heldItem ?? state.riggedAvatar?.anchors.heldItem;
+    let release: RemoteStoneRelease | undefined;
+    if (anchor) {
+      anchor.updateWorldMatrix(true, false);
+      release = {
+        position: anchor.getWorldPosition(new THREE.Vector3()),
+        quaternion: anchor.getWorldQuaternion(new THREE.Quaternion()),
+      };
+    }
+    const callbacks = [...state.pendingStoneReleases];
+    state.pendingStoneReleases.clear();
+    for (const callback of callbacks) callback(release);
   }
 
   private deletePlayer(id: string) {

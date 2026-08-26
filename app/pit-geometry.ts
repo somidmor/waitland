@@ -85,9 +85,9 @@ export function createPitLipGeometry() {
   const uvs: number[] = [];
   const indices: number[] = [];
   const bands = [
-    { radius: PIT_LIP_OUTER_RADIUS, phase: PIT_LIP_OUTER_PHASE, height: -0.018 },
-    { radius: PIT_RADIUS + 0.43, phase: 1.1, height: -0.055 },
-    { radius: PIT_RADIUS, phase: 0.35, height: -0.14 },
+    { radius: PIT_RADIUS + 0.5, phase: 1.1, height: -0.055 },
+    { radius: PIT_RADIUS + 0.24, phase: 0.72, height: -0.1 },
+    { radius: PIT_RADIUS, phase: 0.35, height: -0.16 },
   ] as const;
 
   for (let band = 0; band < bands.length; band += 1) {
@@ -115,6 +115,57 @@ export function createPitLipGeometry() {
 
   const geometry = new THREE.BufferGeometry();
   geometry.name = "waitland-pit-earth-lip";
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingBox();
+  return geometry;
+}
+
+/**
+ * Thin turf fringe that lets the excavation disappear naturally into the
+ * meadow. Keeping this separate from the exposed-earth bank also gives each
+ * surface the correct tileable texture instead of stretching one atlas across
+ * the entire opening.
+ */
+export function createPitTurfGeometry() {
+  const positions: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+  const bands = [
+    { radius: PIT_LIP_OUTER_RADIUS, phase: PIT_LIP_OUTER_PHASE, height: -0.016 },
+    { radius: PIT_RADIUS + 0.68, phase: 1.38, height: -0.028 },
+    { radius: PIT_RADIUS + 0.45, phase: 1.1, height: -0.068 },
+  ] as const;
+
+  for (let band = 0; band < bands.length; band += 1) {
+    const profile = bands[band];
+    for (let index = 0; index <= PIT_EDGE_SEGMENTS; index += 1) {
+      const wrapped = index % PIT_EDGE_SEGMENTS;
+      const angle = (wrapped / PIT_EDGE_SEGMENTS) * Math.PI * 2;
+      const radius = pitEdgeRadius(wrapped, profile.radius, profile.phase);
+      const x = Math.cos(angle) * radius * 1.035;
+      const z = Math.sin(angle) * radius;
+      const tornEdge = band === bands.length - 1 ? Math.sin(angle * 13 + 0.7) * 0.035 : 0;
+      positions.push(x, profile.height + tornEdge, z);
+      // World-space-ish UVs keep the meadow texture scale consistent around
+      // the ring and avoid the visible radial stretching of polar UVs.
+      uvs.push(0.5 + x / 8, 0.5 + z / 8);
+    }
+  }
+
+  const stride = PIT_EDGE_SEGMENTS + 1;
+  for (let band = 0; band < bands.length - 1; band += 1) {
+    for (let index = 0; index < PIT_EDGE_SEGMENTS; index += 1) {
+      const outer = band * stride + index;
+      const inner = (band + 1) * stride + index;
+      indices.push(outer, inner, outer + 1, outer + 1, inner, inner + 1);
+    }
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.name = "waitland-pit-turf-fringe";
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
   geometry.setIndex(indices);

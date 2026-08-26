@@ -174,6 +174,91 @@ test("rigged avatar failures are explicit so callers can choose the procedural f
   }
 });
 
+test("pickup and throw one-shots stay in place and fire release after the evaluated hand pose", async () => {
+  clearRiggedAvatarCache();
+  const source = createTemplate();
+  source.scene.getObjectByName("mixamorig:Hips").name = "Hips";
+  source.animations.push(
+    new THREE.AnimationClip("Dedicated Pickup", 1, [
+      new THREE.VectorKeyframeTrack(
+        "Hips.position",
+        [0, 0.5, 1],
+        [0, 0, 0, 0.3, -0.2, 0.6, 0.8, 0, 1.2],
+      ),
+    ]),
+    new THREE.AnimationClip("Dedicated Throw", 1, [
+      new THREE.VectorKeyframeTrack(
+        "Hips.position",
+        [0, 0.5, 1],
+        [0, 0, 0, 1.2, 0.08, 1.8, 2.4, 0, 3.6],
+      ),
+    ]),
+  );
+  const assetManifest = manifest(6);
+  assetManifest.animations.pickup = "Dedicated Pickup";
+  assetManifest.animations.throw = "Dedicated Throw";
+  assetManifest.animations.pickupTimeScale = 1;
+  assetManifest.animations.throwTimeScale = 1;
+  assetManifest.animations.throwReleaseProgress = 0.54;
+  assetManifest.animations.fadeSeconds = 0;
+  assetManifest.animations.inPlaceInteractions = true;
+
+  const result = await loadRiggedAvatar(assetManifest, {
+    useCache: false,
+    loaderFactory: () => ({
+      async loadAsync() {
+        return { scene: source.scene, animations: source.animations };
+      },
+    }),
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  const avatar = result.avatar;
+  assert.equal(avatar.playInteraction({ kind: "pickup" }), true);
+  assert.equal(avatar.activeAnimation, "pickup");
+  assert.equal(avatar.activeInteraction, "pickup");
+  for (let frame = 0; frame < 11; frame += 1) avatar.update(0.1);
+  assert.equal(avatar.activeAnimation, "idle");
+
+  let releaseEvent;
+  assert.equal(
+    avatar.playInteraction({
+      kind: "throw",
+      onRelease(event) {
+        releaseEvent = event;
+      },
+    }),
+    true,
+  );
+  for (let frame = 0; frame < 5; frame += 1) avatar.update(0.1);
+  assert.equal(releaseEvent, undefined, "the rock remains attached through anticipation");
+  avatar.update(0.05);
+  assert.ok(releaseEvent, "the release marker fires as action time crosses 54%");
+  assert.equal(releaseEvent.kind, "throw");
+  assert.equal(releaseEvent.heldItem, avatar.anchors.heldItem);
+  assert.ok(releaseEvent.progress >= 0.54 && releaseEvent.progress < 0.61);
+
+  const rootTrack = avatar.clips.throw.tracks.find((track) => track.name.endsWith("Hips.position"));
+  assert.ok(rootTrack);
+  const preparedValues = Array.from(rootTrack.values);
+  assert.deepEqual(
+    [preparedValues[0], preparedValues[2], preparedValues[3], preparedValues[5], preparedValues[6], preparedValues[8]],
+    [0, 0, 0, 0, 0, 0],
+    "interaction root motion removes horizontal lunging",
+  );
+  assert.ok(Math.abs(preparedValues[4] - 0.08) < 0.000001, "vertical weight shift remains");
+  const sourceValues = Array.from(source.animations.at(-1).tracks[0].values);
+  assert.ok(Math.abs(sourceValues[3] - 1.2) < 0.000001);
+  assert.ok(Math.abs(sourceValues[5] - 1.8) < 0.000001);
+  assert.ok(Math.abs(sourceValues[6] - 2.4) < 0.000001);
+  assert.ok(Math.abs(sourceValues[8] - 3.6) < 0.000001, "the cached authored clip stays immutable");
+  for (let frame = 0; frame < 6; frame += 1) avatar.update(0.1);
+  assert.equal(avatar.activeInteraction, null);
+  assert.equal(avatar.activeAnimation, "idle");
+  avatar.dispose();
+});
+
 test("clip preparation keeps one bind-pose scale and origin across animation sources", async () => {
   clearRiggedAvatarCache();
   const source = createTemplate();

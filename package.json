@@ -19,6 +19,7 @@
     "realtime:load": "node realtime/scripts/realtime-harness.mjs --load",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.worker.json",
     "lint": "eslint .",
+    "assets:validate": "node scripts/validate-runtime-glbs.mjs",
     "types:cloudflare": "wrangler types worker-configuration.d.ts --config wrangler.jsonc --include-runtime=false",
     "types:cloudflare:realtime": "npm --prefix realtime run types:cloudflare",
     "cloudflare:check:web": "npm run build && wrangler deploy --dry-run --outdir .wrangler/web-dry-run",

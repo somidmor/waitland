@@ -19,6 +19,8 @@ export type {
   RiggedAvatarBoneTransform,
   RiggedAvatarClipSelector,
   RiggedAvatarFailureReason,
+  RiggedAvatarInteractionEvent,
+  RiggedAvatarInteractionKind,
   RiggedAvatarInteractionOptions,
   RiggedAvatarLoadFailure,
   RiggedAvatarLoadOptions,

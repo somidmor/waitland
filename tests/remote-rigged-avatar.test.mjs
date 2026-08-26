@@ -25,7 +25,7 @@ function makeFakeRuntime() {
   heldItem.position.set(0.58, 1.7, -0.3);
   root.add(speech, heldItem, head);
   const material = new THREE.MeshStandardMaterial({ color: 0xffffff });
-  const calls = { updates: [], interactions: 0, disposals: 0 };
+  const calls = { updates: [], interactions: [], releases: [], disposals: 0 };
   const motion = { moving: false, speed: 0, carryingStone: false };
   const runtime = {
     root,
@@ -37,8 +37,9 @@ function makeFakeRuntime() {
       root.updateWorldMatrix(true, true);
       calls.updates.push({ deltaSeconds, ...motion });
     },
-    playInteraction() {
-      calls.interactions += 1;
+    playInteraction(options = {}) {
+      calls.interactions.push(options.kind ?? "interact");
+      if (options.onRelease) calls.releases.push(options.onRelease);
       return true;
     },
     dispose() {
@@ -91,7 +92,7 @@ test("near remote upgrades to the shared rigged model and disposes with its play
   frame(renderer, camera);
   assert.equal(renderer.getRenderMode("near-player"), "loading");
   await flushAsyncLoads();
-  assert.deepEqual(requestedUrls, ["/assets/avatars/v1/waitlander-runtime.glb"]);
+  assert.deepEqual(requestedUrls, ["/assets/avatars/v2/waitlander-runtime.glb"]);
   assert.equal(renderer.getRenderMode("near-player"), "rigged");
   assert.equal(fake.runtime.root.parent?.name, "remote-rigged-avatars");
   assert.equal(fake.runtime.root.userData.waitlandRemotePlayerId, "near-player");
@@ -113,6 +114,78 @@ test("near remote upgrades to the shared rigged model and disposes with its play
   assert.equal(fake.calls.disposals, 1);
   assert.equal(fake.runtime.root.parent, null);
   assert.equal(renderer.getRenderMode("near-player"), undefined);
+  renderer.dispose();
+});
+
+test("authoritative remote carrying changes play pickup then hold the stone until throw release", async () => {
+  const scene = new THREE.Scene();
+  const fake = makeFakeRuntime();
+  const renderer = new RemoteAvatarRenderer(scene, {
+    interpolationDelayMs: 0,
+    maxRiggedPlayers: 1,
+    mobileRiggedPlayers: 1,
+    riggedDistance: 20,
+    riggedAvatarLoader: async () => ({
+      ok: true,
+      avatar: fake.runtime,
+      cacheKey: "interaction-template",
+    }),
+  });
+  const camera = makeCamera();
+  const startedAt = performance.now();
+  renderer.upsert({
+    id: "stone-player",
+    x: 1,
+    z: 0,
+    yaw: 0,
+    moving: false,
+    carryingStone: false,
+  });
+  frame(renderer, camera, startedAt);
+  await flushAsyncLoads();
+  frame(renderer, camera, startedAt + 20);
+
+  renderer.upsert({
+    id: "stone-player",
+    x: 1,
+    z: 0,
+    yaw: 0,
+    moving: false,
+    carryingStone: true,
+  });
+  frame(renderer, camera, startedAt + 40);
+  assert.deepEqual(fake.calls.interactions, ["pickup"]);
+  assert.equal(renderer.stones.count, 1);
+  let authoritativeRelease;
+  assert.equal(
+    renderer.deferStoneRelease("stone-player", (release) => {
+      authoritativeRelease = release;
+    }),
+    true,
+  );
+
+  renderer.upsert({
+    id: "stone-player",
+    x: 1,
+    z: 0,
+    yaw: 0,
+    moving: false,
+    carryingStone: false,
+  });
+  frame(renderer, camera, startedAt + 60);
+  assert.deepEqual(fake.calls.interactions, ["pickup", "throw"]);
+  assert.equal(renderer.stones.count, 1, "the authoritative throw keeps the rock on the hand");
+  assert.equal(authoritativeRelease, undefined, "world placement waits for the animation beat");
+
+  fake.calls.releases.at(-1)({
+    kind: "throw",
+    progress: 0.54,
+    heldItem: fake.runtime.anchors.heldItem,
+  });
+  frame(renderer, camera, startedAt + 80);
+  assert.equal(renderer.stones.count, 0, "the remote rock leaves the hand at the release marker");
+  assert.ok(authoritativeRelease);
+  assert.ok(authoritativeRelease.position.distanceTo(new THREE.Vector3(1.58, 1.7, -0.3)) < 0.001);
   renderer.dispose();
 });
 
@@ -213,6 +286,77 @@ test("a GLB load failure leaves the complete colored procedural fallback visible
   });
   assert.ok(coloredFallbackParts.length >= 10);
   renderer.dispose();
+});
+
+test("transient shared GLB failure retries and upgrades every eligible remote", async () => {
+  const scene = new THREE.Scene();
+  const successfulRuntimes = [makeFakeRuntime(), makeFakeRuntime()];
+  let loadAttempts = 0;
+  const renderer = new RemoteAvatarRenderer(scene, {
+    interpolationDelayMs: 0,
+    maxRiggedPlayers: 2,
+    mobileRiggedPlayers: 2,
+    riggedDistance: 20,
+    riggedAvatarLoader: async (manifest) => {
+      loadAttempts += 1;
+      if (loadAttempts <= 2) {
+        return {
+          ok: false,
+          reason: "load-failed",
+          error: new Error("temporary shared asset failure"),
+          manifest,
+        };
+      }
+      return {
+        ok: true,
+        avatar: successfulRuntimes[loadAttempts - 3].runtime,
+        cacheKey: "shared-retry-template",
+      };
+    },
+  });
+  renderer.upsert({ id: "retry-left", x: -1, z: 0, yaw: 0, moving: false });
+  renderer.upsert({ id: "retry-right", x: 1, z: 0, yaw: 0, moving: false });
+
+  const camera = makeCamera();
+  const startedAt = performance.now();
+  frame(renderer, camera, startedAt);
+  assert.equal(renderer.getRenderMode("retry-left"), "loading");
+  assert.equal(renderer.getRenderMode("retry-right"), "loading");
+  await flushAsyncLoads();
+  assert.equal(loadAttempts, 2);
+  assert.equal(renderer.getRenderMode("retry-left"), "procedural");
+  assert.equal(renderer.getRenderMode("retry-right"), "procedural");
+
+  frame(renderer, camera, startedAt + 100);
+  assert.equal(loadAttempts, 2, "backoff prevents a request on every animation frame");
+  const fallbackPartsDuringBackoff = [];
+  scene.traverse((object) => {
+    if (object instanceof THREE.InstancedMesh && object.instanceColor && object.count > 0) {
+      fallbackPartsDuringBackoff.push(object);
+    }
+  });
+  assert.ok(fallbackPartsDuringBackoff.length >= 10, "fallback stays visible during backoff");
+
+  frame(renderer, camera, startedAt + 10_000);
+  assert.equal(renderer.getRenderMode("retry-left"), "loading");
+  assert.equal(renderer.getRenderMode("retry-right"), "loading");
+  await flushAsyncLoads();
+  assert.equal(loadAttempts, 4);
+  assert.equal(renderer.getRenderMode("retry-left"), "rigged");
+  assert.equal(renderer.getRenderMode("retry-right"), "rigged");
+
+  frame(renderer, camera, startedAt + 10_020);
+  const fallbackPartsAfterSuccess = [];
+  scene.traverse((object) => {
+    if (object instanceof THREE.InstancedMesh && object.instanceColor && object.count > 0) {
+      fallbackPartsAfterSuccess.push(object);
+    }
+  });
+  assert.equal(fallbackPartsAfterSuccess.length, 0, "rigged remotes replace every fallback");
+  assert.ok(successfulRuntimes.every(({ runtime }) => runtime.root.visible));
+
+  renderer.dispose();
+  assert.ok(successfulRuntimes.every(({ calls }) => calls.disposals === 1));
 });
 
 test("visible remotes across the default render range request the authored model", async () => {

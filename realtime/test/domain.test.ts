@@ -10,6 +10,7 @@ import {
   getForwardStonePosition,
   getNextNearbyStoneGeneration,
   getStoneDescriptor,
+  headingTowardPit,
   isNearPitStonePosition,
 } from "../../shared/world.ts";
 import {
@@ -131,6 +132,21 @@ test("a non-deposited throw lands a shared fixed distance from its action-time p
   assert.equal(landing.x, 40);
   assert.equal(landing.z, 40 - STONE_THROW_DISTANCE);
   assert.equal(Math.hypot(landing.x - 40, landing.z - 40), STONE_THROW_DISTANCE);
+});
+
+test("fresh avatars face inward with gameplay -Z as their forward axis", () => {
+  for (const [x, z] of [
+    [18, 0],
+    [-12, 15],
+    [9, -20],
+  ]) {
+    const heading = headingTowardPit(x, z);
+    const landing = getForwardStonePosition(x, z, heading, 1);
+    assert.ok(
+      Math.hypot(landing.x, landing.z) < Math.hypot(x, z),
+      `heading at ${x},${z} must point toward the pit`,
+    );
+  }
 });
 
 test("every deterministic generation reserves enough stones near the pit", () => {
