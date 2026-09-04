@@ -1,6 +1,7 @@
 import {
   CARRY_SPEED,
-  PIT_WALL_RADIUS,
+  getPitLayout,
+  type PitLayout,
   WALK_SPEED,
   clampPositionOutsidePit,
 } from "../../shared/world.ts";
@@ -42,19 +43,19 @@ function text(value: unknown, fallback: string, maxCharacters: number) {
 
 export function sanitizeProfile(value: unknown): PublicProfile {
   const input = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-  const rawCode = text(input.countryCode, "XX", 2).toUpperCase();
-  const countryCode = /^[A-Z]{2}$/.test(rawCode) ? rawCode : "XX";
+  const rawCode = text(input.countryCode, "", 2).toUpperCase();
+  const countryCode = /^[A-Z]{2}$/.test(rawCode) ? rawCode : "";
   const generatedFlag =
-    countryCode === "XX"
-      ? "🌍"
+    !countryCode || countryCode === "XX"
+      ? ""
       : String.fromCodePoint(...Array.from(countryCode).map((letter) => 127397 + letter.charCodeAt(0)));
 
   return {
-    name: text(input.name, "Traveler", 24),
-    city: text(input.city, "Somewhere", 32),
+    name: text(input.name, "", 24),
+    city: text(input.city, "", 32),
     countryCode,
     countryFlag: generatedFlag,
-    waitReason: text(input.waitReason, "Just waiting", 40),
+    waitReason: text(input.waitReason, "Just waiting", 60),
   };
 }
 
@@ -111,7 +112,7 @@ export function replenishedMovementCredit(player: StoredPlayer, now: number) {
  * Validates an untrusted predicted position. Client clocks and velocities are
  * ignored; the server clock bounds displacement and derives velocity.
  */
-export function validateMovement(player: StoredPlayer, message: MoveMessage, now: number): MovementResult | null {
+export function validateMovement(player: StoredPlayer, message: MoveMessage, now: number, pit: PitLayout = getPitLayout()): MovementResult | null {
   if (!Number.isSafeInteger(message.seq) || message.seq <= player.lastSeq) return null;
   if (!isSafeWorldCoordinate(message.x) || !isSafeWorldCoordinate(message.z)) return null;
 
@@ -125,7 +126,7 @@ export function validateMovement(player: StoredPlayer, message: MoveMessage, now
   const scale = distance > acceptedDistance ? acceptedDistance / distance : 1;
   const boundedX = player.x + deltaX * scale;
   const boundedZ = player.z + deltaZ * scale;
-  const safe = clampPositionOutsidePit(boundedX, boundedZ);
+  const safe = clampPositionOutsidePit(boundedX, boundedZ, pit);
   const actualElapsed = Math.max(0.016, (now - player.lastMoveAt) / 1_000);
   const explicitStop =
     typeof message.vx === "number" &&
@@ -160,18 +161,19 @@ export function validateMovement(player: StoredPlayer, message: MoveMessage, now
   };
 }
 
-export function safeSpawn(actorId: string, occupied: Array<{ x: number; z: number }> = []) {
+export function safeSpawn(actorId: string, occupied: Array<{ x: number; z: number }> = [], pit: PitLayout = getPitLayout()) {
   let hash = 2166136261;
   for (const character of actorId) {
     hash ^= character.charCodeAt(0);
     hash = Math.imul(hash, 16777619);
   }
   const baseAngle = ((hash >>> 0) / 4_294_967_296) * Math.PI * 2;
-  const baseRadius = 16 + ((hash >>> 8) % 1_800) / 100;
+  const baseRadius = pit.wallRadius + 4.5 + ((hash >>> 8) % 300) / 100;
   return findNonStackedPosition(
-    Math.cos(baseAngle) * baseRadius,
-    Math.sin(baseAngle) * baseRadius,
+    pit.center.x + Math.cos(baseAngle) * baseRadius,
+    pit.center.z + Math.sin(baseAngle) * baseRadius,
     occupied,
+    pit,
   );
 }
 
@@ -180,10 +182,12 @@ export function findNonStackedPosition(
   desiredX: number,
   desiredZ: number,
   occupied: Array<{ x: number; z: number }>,
+  pit: PitLayout = getPitLayout(),
 ) {
   const safe = clampPositionOutsidePit(
     isSafeWorldCoordinate(desiredX) ? desiredX : 0,
     isSafeWorldCoordinate(desiredZ) ? desiredZ : 18,
+    pit,
   );
   const minimumDistance = PLAYER_RADIUS * 2.15;
   const buckets = new Map<string, Array<{ x: number; z: number }>>();
@@ -197,8 +201,8 @@ export function findNonStackedPosition(
   }
   const isFree = (x: number, z: number) => {
     if (!isSafeWorldCoordinate(x) || !isSafeWorldCoordinate(z)) return false;
-    const radius = Math.hypot(x, z);
-    if (radius < PIT_WALL_RADIUS + PLAYER_RADIUS) return false;
+    const radius = Math.hypot(x - pit.center.x, z - pit.center.z);
+    if (radius < pit.wallRadius + PLAYER_RADIUS) return false;
     const cellX = cell(x);
     const cellZ = cell(z);
     for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
@@ -220,6 +224,7 @@ export function findNonStackedPosition(
     const candidate = clampPositionOutsidePit(
       safe.x + Math.cos(angle) * radius,
       safe.z + Math.sin(angle) * radius,
+      pit,
     );
     if (isFree(candidate.x, candidate.z)) {
       return { x: roundPosition(candidate.x), z: roundPosition(candidate.z) };

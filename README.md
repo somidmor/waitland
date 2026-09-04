@@ -1,14 +1,24 @@
 # Waitland
 
 Waitland is a portrait-first, account-free browser game for the minutes people
-spend waiting. Visitors enter anonymously, walk around a shared 3D field, carry
-one stone at a time to a global 1,000-stone pit, and talk through short nearby
-speech bubbles.
+spend waiting. Visitors enter only what they are waiting for, tap a rock to collect it, then
+tap the pit to walk over and throw. The first 100 shared rocks become a named,
+dated statue. A larger pit opens beside it, needing 200 rocks, then 300, and so
+on. Every completed statue remains recorded by the global coordinator.
 
 - Web app: <https://waitland.app>
 - Realtime service: <https://realtime.waitland.app>
 - Architecture and agent handoff: [`AGENTS.md`](./AGENTS.md)
 - Multiplayer details: [`MULTIPLAYER.md`](./MULTIPLAYER.md)
+
+## Playing
+
+- One reason, one button, no name, location, account, or sign-in.
+- Tap a rock to walk to it and collect it; tap the pit or the action button to throw.
+- Touch joystick, WASD/arrows, and Space are also supported.
+- Carry one rock, see nearby people, exchange short speech bubbles.
+- Optional gentle sounds; white wings carry you away when your wait ends.
+- Offline play stays separate on the device; reconnecting restores shared progress.
 
 ## Architecture
 

@@ -4,11 +4,16 @@ import worker, {
   FieldRoom,
   Lobby,
   PitCoordinator,
+  PitFanout,
 } from "../src/index.ts";
 import {
   FIELD_STONE_COUNT,
   MIN_NEAR_PIT_STONES,
-  getForwardStonePosition,
+  createInitialPitState,
+  advancePitState,
+  isPitState,
+  getPitLayout,
+  type PitState,
   isNearPitStonePosition,
 } from "../../shared/world.ts";
 import {
@@ -27,6 +32,7 @@ class MemoryStorage {
   readonly records = new Map<string, unknown>();
   alarm: number | null = null;
   failNextSetAlarm = false;
+  private transactionQueue: Promise<unknown> = Promise.resolve();
 
   constructor(initial: Record<string, unknown> = {}) {
     for (const [key, value] of Object.entries(initial)) this.records.set(key, value);
@@ -69,7 +75,17 @@ class MemoryStorage {
       },
       delete: async (key: string) => this.records.delete(key),
     };
-    return closure(transaction);
+    const operation = this.transactionQueue.then(async () => {
+      const before = structuredClone(this.records);
+      try { return await closure(transaction); }
+      catch (error) {
+        this.records.clear();
+        for (const [key, value] of before) this.records.set(key, value);
+        throw error;
+      }
+    });
+    this.transactionQueue = operation.catch(() => undefined);
+    return operation;
   }
 
   async getAlarm() {
@@ -543,7 +559,7 @@ test("the final deposit atomically survives a crash before its fanout alarm", as
     return Response.json({ ok: true });
   });
   const storage = new MemoryStorage({
-    count: 999,
+    count: 99,
     "subscriber-shards": [3],
   });
   const firstState = new MockState(storage);
@@ -565,12 +581,14 @@ test("the final deposit atomically survives a crash before its fanout alarm", as
     })),
     /simulated-alarm-write-failure/,
   );
-  assert.equal(storage.records.get("count"), 1_000);
-  assert.deepEqual(storage.records.get("deposit:field:test:stone-final:0"), { count: 1_000 });
-  assert.deepEqual(storage.records.get("pending-fanout-targets"), { "3": 1_000 });
+  assert.equal(storage.records.get("count"), 0);
+  assert.equal((storage.records.get("pit-state") as PitState).round, 2);
+  assert.equal((storage.records.get("monument:1") as { stoneCount: number }).stoneCount, 100);
+  assert.deepEqual(storage.records.get("deposit:field:test:stone-final:0"), { count: 0 });
+  assert.deepEqual(storage.records.get("pending-fanout-targets"), { "3": 100 });
 
   // A fresh isolate reconstructs the pending target, arms the alarm, and
-  // delivers the otherwise terminal 1,000th update without another deposit.
+  // delivers the otherwise 100th deposit and the next excavation without another deposit.
   const recoveredState = new MockState(storage);
   const recovered = new PitCoordinator(
     recoveredState as unknown as DurableObjectState,
@@ -579,7 +597,7 @@ test("the final deposit atomically survives a crash before its fanout alarm", as
   await recoveredState.ready;
   assert.ok(storage.alarm !== null);
   await recovered.alarm();
-  assert.deepEqual(delivered, [{ shard: "fanout-3", count: 1_000 }]);
+  assert.deepEqual(delivered, [{ shard: "fanout-3", count: 0 }]);
   assert.deepEqual(storage.records.get("pending-fanout-targets"), {});
 });
 
@@ -788,7 +806,7 @@ test("picking up the tenth nearby stone immediately replenishes the fixed pool",
   assert.ok(actionMessageIndex > replenishedMessageIndex);
 });
 
-test("a delayed throw acknowledgement keeps the action-time forward landing and wire order", async () => {
+test("a failed delayed throw keeps ownership and can be retried without losing the stone", async () => {
   const actorId = uuid(95_100);
   const connectionId = uuid(95_101);
   const now = Date.now();
@@ -863,20 +881,12 @@ test("a delayed throw acknowledgement keeps the action-time forward landing and 
   finishDeposit(Response.json({ accepted: false, count: 1_000 }));
   await throwing;
 
-  const stoneMessageIndex = messages.findIndex(
-    (message) =>
-      message.t === "stone" &&
-      (message.stone as { id?: string } | undefined)?.id === carriedStoneId,
-  );
-  const actionMessageIndex = messages.findIndex(
-    (message) => message.t === "action" && message.id === actionId,
-  );
-  assert.ok(stoneMessageIndex >= 0);
-  assert.ok(actionMessageIndex > stoneMessageIndex);
-  const stoneMessage = messages[stoneMessageIndex].stone as { x: number; z: number };
-  const expected = getForwardStonePosition(10, 0, 0);
-  assert.deepEqual({ x: stoneMessage.x, z: stoneMessage.z }, expected);
-  assert.equal(Math.hypot(stoneMessage.x - 10, stoneMessage.z), 7.5);
+  const action = messages.find((message) => message.t === "action" && message.id === actionId);
+  assert.equal(action?.ok, false);
+  assert.equal(action?.reason, "pit-unavailable");
+  assert.equal((storage.records.get(`player:${actorId}`) as StoredPlayer).carrying, carriedStoneId);
+  assert.equal((storage.records.get(`stone:${carriedStoneId}`) as { holderId: string }).holderId, actorId);
+  assert.equal((storage.records.get(`player:${actorId}`) as StoredPlayer).actionHistory.some((entry) => entry.id === actionId), false);
 });
 
 test("a dormant field room expires sleepers on its alarm and schedules the next retention deadline", async () => {
@@ -1196,4 +1206,119 @@ test("a last-player disconnect during pit subscribe removes the raced subscripti
     socketMessages.map((message) => JSON.parse(message)),
     [{ t: "player_leave", playerId: actorId }],
   );
+});
+
+
+test("concurrent deposits roll over exactly once and old retries preserve the current pit", async () => {
+  const storage = new MemoryStorage({ count: 99 });
+  const state = new MockState(storage);
+  const coordinator = new PitCoordinator(state as unknown as DurableObjectState, envWith({}));
+  await state.ready;
+  const deposit = (key: string) => coordinator.fetch(new Request("https://pit/deposit", {
+    method: "POST", body: JSON.stringify({ actionKey: key }),
+  })).then((response) => response.json() as Promise<{ count: number; duplicate: boolean; pit: PitState }>);
+  const results = await Promise.all(Array.from({ length: 12 }, (_, index) => deposit(`race-${index}`)));
+  assert.equal(results.filter((result) => result.pit.count === 0).length, 1);
+  const current = await coordinator.fetch(new Request("https://pit/state")).then((response) => response.json() as Promise<PitState>);
+  assert.equal(current.round, 2);
+  assert.equal(current.count, 11);
+  assert.equal(current.totalStones, 111);
+  assert.equal(current.monuments.length, 1);
+  assert.equal(isPitState(current), true);
+  const retry = await deposit("race-0");
+  assert.equal(retry.duplicate, true);
+  assert.equal(retry.pit.totalStones, 111);
+  assert.equal(retry.pit.round, 2);
+  assert.equal([...storage.records.keys()].filter((key) => key.startsWith("monument:")).length, 1);
+});
+
+test("legacy deposits migrate without loss and the coordinator restores all monument metadata", async () => {
+  const storage = new MemoryStorage({ count: 999 });
+  const firstState = new MockState(storage);
+  const first = new PitCoordinator(firstState as unknown as DurableObjectState, envWith({}));
+  await firstState.ready;
+  const firstPit = await first.fetch(new Request("https://pit/state")).then((response) => response.json() as Promise<PitState>);
+  assert.equal(firstPit.round, 4);
+  assert.equal(firstPit.count, 399);
+  assert.equal(firstPit.totalStones, 999);
+  assert.equal(firstPit.monuments.length, 3);
+  const secondState = new MockState(storage);
+  const second = new PitCoordinator(secondState as unknown as DurableObjectState, envWith({}));
+  await secondState.ready;
+  const restored = await second.fetch(new Request("https://pit/state")).then((response) => response.json());
+  assert.deepEqual(restored, firstPit);
+});
+
+test("fanout keeps active room subscriptions after a monument is completed", async () => {
+  const roomId = `field-${uuid(97_000)}`;
+  const storage = new MemoryStorage({ [`room:${roomId}`]: Date.now() });
+  const state = new MockState(storage);
+  let deliveries = 0;
+  const rooms = namespace(async () => { deliveries += 1; return Response.json({ active: 2 }); });
+  const fanout = new PitFanout(state as unknown as DurableObjectState, envWith({ ROOMS: rooms }));
+  await state.ready;
+  let pit = { ...createInitialPitState(), count: 99, totalStones: 99 };
+  pit = advancePitState(pit);
+  for (let index = 0; index < 2; index += 1) {
+    const response = await fanout.fetch(new Request("https://fanout/pit-update", {
+      method: "POST", body: JSON.stringify({ count: pit.count, capacity: pit.capacity, pit }),
+    }));
+    assert.equal(response.status, 200);
+    pit = advancePitState(pit);
+  }
+  assert.equal(deliveries, 2);
+  assert.equal(storage.records.has(`room:${roomId}`), true);
+});
+
+test("room rollover moves the stone supply and corrects visitors inside the new excavation", async () => {
+  const actorId = uuid(97_100);
+  const connectionId = uuid(97_101);
+  const nextLayout = getPitLayout(2);
+  const now = Date.now();
+  const player: StoredPlayer = {
+    id: actorId, x: nextLayout.center.x, z: nextLayout.center.z, vx: 0, vz: 0, heading: 0,
+    carrying: null, sleeping: false,
+    profile: { name: "", city: "", countryCode: "", countryFlag: "", waitReason: "A friend" },
+    lastMoveAt: now, lastSeenAt: now, lastSeq: -1, actionHistory: [],
+  };
+  const messages: Array<Record<string, unknown>> = [];
+  const socket = {
+    deserializeAttachment: () => ({ actorId, connectionId }),
+    send: (message: string) => messages.push(JSON.parse(message) as Record<string, unknown>),
+  } as unknown as WebSocket;
+  const before = { ...createInitialPitState(now), count: 99, totalStones: 99 };
+  const storage = new MemoryStorage({ "pit-state": before, [`player:${actorId}`]: player });
+  const state = new MockState(storage, [socket]);
+  const room = new FieldRoom(state as unknown as DurableObjectState, envWith({}));
+  await state.ready;
+  const next = advancePitState(before, now + 100);
+  await room.fetch(new Request("https://room/pit-update", { method: "POST", body: JSON.stringify({ ...next, pit: next }) }));
+  const stored = storage.records.get(`player:${actorId}`) as StoredPlayer;
+  assert.ok(Math.hypot(stored.x - next.center.x, stored.z - next.center.z) >= next.wallRadius);
+  const stones = [...storage.records.entries()].filter(([key]) => key.startsWith("stone:")).map(([, stone]) => stone as { x: number; z: number });
+  assert.equal(stones.length, FIELD_STONE_COUNT);
+  assert.ok(stones.filter((stone) => isNearPitStonePosition(stone.x, stone.z, next)).length >= MIN_NEAR_PIT_STONES);
+  // A delayed old-round fanout must never resurrect the previous pit.
+  await room.fetch(new Request("https://room/pit-update", { method: "POST", body: JSON.stringify({ ...before, pit: before }) }));
+  assert.equal((storage.records.get("pit-state") as PitState).round, 2);
+  assert.ok(messages.some((message) => message.t === "pit" && (message.pit as PitState).round === 2));
+});
+
+
+test("normal gameplay dedupe stays bounded per stone and retains legacy replay safety", async () => {
+  const roomId = `field-${uuid(98_000)}`;
+  const storage = new MemoryStorage({ count: 1, [`deposit:${roomId}:stone-0:0`]: { count: 1 } });
+  const state = new MockState(storage);
+  const coordinator = new PitCoordinator(state as unknown as DurableObjectState, envWith({}));
+  await state.ready;
+  const deposit = (generation: number) => coordinator.fetch(new Request("https://pit/deposit", {
+    method: "POST", body: JSON.stringify({ actionKey: `${roomId}:stone-0:${generation}` }),
+  })).then((response) => response.json() as Promise<{ duplicate: boolean; pit: PitState }>);
+  assert.equal((await deposit(0)).duplicate, true);
+  for (let generation = 1; generation <= 20; generation += 1) assert.equal((await deposit(generation)).duplicate, false);
+  const staleRetry = await deposit(4);
+  assert.equal(staleRetry.duplicate, true);
+  assert.equal(staleRetry.pit.totalStones, 21);
+  assert.equal([...storage.records.keys()].filter((key) => key.startsWith("deposit-latest:")).length, 1);
+  assert.equal([...storage.records.keys()].filter((key) => key.startsWith("deposit:")).length, 1);
 });

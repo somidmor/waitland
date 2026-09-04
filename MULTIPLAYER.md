@@ -90,20 +90,37 @@ movement is never sent through a global object.
 
 ### Global pit and hierarchical fanout
 
-`PitCoordinator("global-pit")` is the only serializer for the shared 1,000-stone
-objective. A deposit key includes room, stone, and stone generation, so a room
-retry after a cross-object failure cannot increment the pit twice.
+`PitCoordinator("global-pit")` serializes the shared excavation lifecycle.
+The first pit holds 100 stones; round N holds N × 100. The final deposit
+atomically creates a named monument with start/completion timestamps and its
+stone count, then opens the next, larger excavation 26 units to the right.
+Every validated throw counts, including throws in flight from another room
+when a round completes. A deposit key includes room, stone, and generation,
+so a retry after a cross-object failure cannot count twice. Normal gameplay
+dedupe keeps one latest accepted generation per room/stone (at most 84 per
+room), rather than accumulating a record per throw. Older generations are
+already consumed; original prototype keys remain readable for continuity.
 
-The coordinator coalesces changed counts behind a 250 ms alarm. It publishes
-to 32 `PitFanout` Durable Objects; each fanout shard forwards the update to only
-its subscribed active rooms in batches of six. This keeps global movement out
-of the coordinator and avoids one coordinator subrequest per room.
+The `pit-state` storage key holds the current round, count, capacity, layout,
+start time, lifetime total and eight newest monument summaries. Each completed
+monument is also retained under `monument:<round>` independently of that bounded
+snapshot. The legacy `count` value is converted on first load, preserving up to
+the original 1,000 deposits. Existing Worker names, Durable Object identities,
+class migrations and session secrets remain unchanged.
 
-Subscriptions are stored as individual keys rather than one growing array.
-Empty rooms unsubscribe, failed fanout shards are persisted with their newest
-target count and retried with bounded backoff, and the final 1,000th update
-clears the room subscription tree. Once complete, later rooms receive the final
-state without being registered for updates that can never occur.
+Count, monument, idempotency key and fanout targets commit in one storage
+transaction. Targets use the lifetime `totalStones`, which remains monotonic
+when the current count resets. The coordinator coalesces updates behind a
+250 ms alarm and publishes to 32 `PitFanout` objects; each forwards to its
+active rooms in batches of six. Failed shards retain durable targets and retry
+with bounded backoff. Subscriptions survive round completion; empty rooms
+unsubscribe. Reconstruction rearms unfinished fanout after a crash.
+
+Rooms apply snapshots only when their lifetime total is at least as new as the
+current one. On rollover they regenerate the fixed unheld stone pool around
+the active excavation, preserve held stones, and move anyone standing inside
+the newborn pit to its edge. Fresh arrivals spawn near the current pit. Shared
+layout helpers keep rendering, prediction, collision and placement consistent.
 
 ### Hibernation, reconnects, and private dormant state
 
@@ -398,7 +415,7 @@ Worker deployment, followed by the smoke harness.
   resumes stable. A two-level cohort allocator is the next step only if that
   simple expansion is insufficient. The single PitCoordinator can still become a deposit
   bottleneck near the per-object throughput boundary, but it carries only the
-  finite 1,000-deposit objective and no movement traffic. Add admission-rate
+  low-frequency deposits and no movement traffic. Add admission-rate
   limiting first; change the objective topology only if measured traffic
   requires it.
 - Field rooms are bounded visibility cohorts, not different objectives: every
@@ -413,3 +430,13 @@ Cloudflare references: [Durable Object limits](https://developers.cloudflare.com
 [WebSocket hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/),
 [Durable Object lifecycle](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/),
 and [D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
+
+
+### Local lifecycle integration gate
+
+`npm --prefix realtime run verify` includes `test:integration`, which bundles
+the real Worker and launches an isolated local workerd runtime. It seeds the
+coordinator only through a private Durable Object binding, then uses two actual
+WebSockets to verify movement, pickup, the 100th deposit, shared monument
+fanout, a round-two deposit, durable runtime restart and anonymous resume.
+There are no public test routes and no production state is touched.

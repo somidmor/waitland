@@ -1,11 +1,12 @@
+// Retain this key so returning visitors keep their reason after the redesign.
 export const PROFILE_STORAGE_KEY = "waiting-pit-profile-v1";
 
 export const WAIT_REASONS = [
-  { id: "appointment", label: "Appointment", phrase: "an appointment" },
+  { id: "order", label: "☕ My coffee", phrase: "my coffee" },
   { id: "ride", label: "A ride", phrase: "a ride" },
-  { id: "order", label: "Food or order", phrase: "food or an order" },
   { id: "person", label: "Someone", phrase: "someone" },
-  { id: "other", label: "Something else", phrase: "something else" },
+  { id: "appointment", label: "An appointment", phrase: "an appointment" },
+  { id: "other", label: "A fresh start", phrase: "a fresh start" },
 ] as const;
 
 export type WaitReasonId = (typeof WAIT_REASONS)[number]["id"];
@@ -26,47 +27,46 @@ export type WaitingPitProps = {
   onEditProfile: (trigger: HTMLButtonElement) => void;
 };
 
+function cleanText(value: unknown, length: number) {
+  return typeof value === "string" ? Array.from(value.replace(/[\u0000-\u001f\u007f<>]/g, "").trim()).slice(0, length).join("") : "";
+}
+
+export function createWaitProfile(reason: string, previous?: WaitProfile | null): WaitProfile {
+  const reasonText = cleanText(reason, 50);
+  const matchingReason = WAIT_REASONS.find((shortcut) => shortcut.phrase.toLowerCase() === reasonText.toLowerCase());
+  return {
+    name: cleanText(previous?.name, 24),
+    city: cleanText(previous?.city, 60),
+    country: cleanText(previous?.country, 60),
+    countryCode: /^[A-Z]{2}$/.test(previous?.countryCode ?? "") ? previous!.countryCode : "",
+    reasonId: matchingReason?.id ?? "other",
+    reasonText,
+  };
+}
+
 export function countryCodeToFlag(countryCode: string) {
   const normalized = countryCode.trim().toUpperCase();
   if (!/^[A-Z]{2}$/.test(normalized)) return "🌍";
-
-  return String.fromCodePoint(
-    ...Array.from(normalized).map((letter) => 127397 + letter.charCodeAt(0)),
-  );
+  return String.fromCodePoint(...Array.from(normalized).map((letter) => 127397 + letter.charCodeAt(0)));
 }
 
 export function parseStoredProfile(rawProfile: string | null): WaitProfile | null {
   if (!rawProfile) return null;
-
   try {
-    const value = JSON.parse(rawProfile) as Partial<WaitProfile>;
-    const validReason = WAIT_REASONS.some((reason) => reason.id === value.reasonId);
-    const name = typeof value.name === "string" ? value.name.trim() : "";
-    const city = typeof value.city === "string" ? value.city.trim() : "";
-    const country = typeof value.country === "string" ? value.country.trim() : "";
-    const countryCode =
-      typeof value.countryCode === "string" ? value.countryCode.trim().toUpperCase() : "";
-    const reasonText = typeof value.reasonText === "string" ? value.reasonText.trim() : "";
-    if (
-      !name ||
-      !city ||
-      !country ||
-      !/^[A-Z]{2}$/.test(countryCode) ||
-      !reasonText ||
-      !validReason
-    ) {
-      return null;
-    }
-
+    const value: unknown = JSON.parse(rawProfile);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const profile = value as Partial<WaitProfile>;
+    const reasonText = cleanText(profile.reasonText, 50);
+    if (!reasonText) return null;
+    const countryCode = cleanText(profile.countryCode, 2).toUpperCase();
+    const reasonId = WAIT_REASONS.some((reason) => reason.id === profile.reasonId) ? profile.reasonId as WaitReasonId : "other";
     return {
-      name: name.slice(0, 24),
-      city: city.slice(0, 60),
-      country: country.slice(0, 60),
-      countryCode,
-      admin1: typeof value.admin1 === "string" ? value.admin1.slice(0, 60) : undefined,
-      locationId: typeof value.locationId === "number" ? value.locationId : undefined,
-      reasonId: value.reasonId as WaitReasonId,
-      reasonText: reasonText.slice(0, 50),
+      name: cleanText(profile.name, 24),
+      city: cleanText(profile.city, 60),
+      country: cleanText(profile.country, 60),
+      countryCode: /^[A-Z]{2}$/.test(countryCode) ? countryCode : "",
+      reasonId,
+      reasonText,
     };
   } catch {
     return null;

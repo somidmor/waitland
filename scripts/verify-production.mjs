@@ -11,7 +11,11 @@ const endpoints = [
       body?.ok === true &&
       body?.protocol === 1 &&
       Number.isFinite(body?.pit?.count) &&
-      body?.pit?.capacity === 1_000,
+      Number.isSafeInteger(body?.pit?.round) && body.pit.round >= 1 &&
+      body.pit.capacity === body.pit.round * 100 &&
+      body.pit.count >= 0 && body.pit.count < body.pit.capacity &&
+      Number.isFinite(body.pit.center?.x) && Number.isFinite(body.pit.center?.z) &&
+      Array.isArray(body.pit.monuments),
   },
   {
     url: "https://waitland.app/health",

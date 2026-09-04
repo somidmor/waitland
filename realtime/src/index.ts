@@ -3,10 +3,14 @@ import {
   FIELD_STONE_COUNT,
   MIN_NEAR_PIT_STONES,
   PIT_CAPACITY,
-  PIT_THROW_RADIUS,
-  PIT_WALL_RADIUS,
   PICKUP_RADIUS,
   WORLD_PROTOCOL_VERSION,
+  advancePitState,
+  clampPositionOutsidePit,
+  createInitialPitState,
+  isPitState,
+  migrateLegacyPitState,
+  type PitState,
   getNextNearbyStoneGeneration,
   getForwardStonePosition,
   getStoneDescriptor,
@@ -567,7 +571,7 @@ export class Lobby extends DurableObject<Env> {
 }
 
 export class PitCoordinator extends DurableObject<Env> {
-  private count = 0;
+  private pit = createInitialPitState();
   private subscriberShards = new Set<number>();
   private pendingFanoutTargets = new Map<number, number>();
   private fanoutRetryMs = 1_000;
@@ -575,7 +579,13 @@ export class PitCoordinator extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
-      this.count = (await ctx.storage.get<number>("count")) || 0;
+      const saved = await ctx.storage.get<PitState>("pit-state");
+      this.pit = isPitState(saved) ? saved : migrateLegacyPitState((await ctx.storage.get<number>("count")) || 0);
+      if (!isPitState(saved)) {
+        const records: Record<string, unknown> = { "pit-state": this.pit, count: this.pit.count };
+        for (const monument of this.pit.monuments) records[`monument:${monument.round}`] = monument;
+        await ctx.storage.put(records);
+      }
       const savedShards = (await ctx.storage.get<number[]>("subscriber-shards")) || [];
       this.subscriberShards = new Set(
         savedShards.filter(
@@ -607,17 +617,12 @@ export class PitCoordinator extends DurableObject<Env> {
   async fetch(request: Request) {
     const url = new URL(request.url);
     if (url.pathname === "/state" && request.method === "GET") {
-      return json({ count: this.count, capacity: PIT_CAPACITY });
+      return json(this.pit);
     }
 
     if (url.pathname === "/subscribe" && request.method === "POST") {
       const { roomId } = (await request.json()) as { roomId?: string };
       if (!roomId || !isRoomId(roomId)) return json({ error: "invalid-room" }, 400);
-      // The objective is monotonic. Once it is complete no room needs future
-      // updates, so avoid growing a fan-out registry that can never be used.
-      if (this.count >= PIT_CAPACITY) {
-        return json({ count: this.count, capacity: PIT_CAPACITY });
-      }
       const shardNumber = pitFanoutShard(roomId);
       const fanout = this.env.PIT_FANOUT.get(this.env.PIT_FANOUT.idFromName(`fanout-${shardNumber}`));
       const subscription = await fanout.fetch("https://fanout/subscribe", {
@@ -630,7 +635,7 @@ export class PitCoordinator extends DurableObject<Env> {
         this.subscriberShards.add(shardNumber);
         await this.ctx.storage.put("subscriber-shards", [...this.subscriberShards]);
       }
-      return json({ count: this.count, capacity: PIT_CAPACITY });
+      return json(this.pit);
     }
 
     if (url.pathname === "/unsubscribe" && request.method === "POST") {
@@ -661,37 +666,58 @@ export class PitCoordinator extends DurableObject<Env> {
     // window where a crash after the final deposit could leave active rooms
     // permanently one update behind.
     const targetShards = [...this.subscriberShards];
+    const parts = /^(field-[0-9a-f-]+):(stone-[0-9]+):([0-9]+)$/i.exec(input.actionKey);
+    const generation = parts ? Number(parts[3]) : undefined;
+    const stoneKey = parts && isRoomId(parts[1]) && parseStoneIndex(parts[2]) !== null &&
+      Number.isSafeInteger(generation) && generation! >= 0 && generation! <= 0x7fff_ffff
+      ? `deposit-latest:${parts[1]}:${parts[2]}` : null;
     const outcome = await this.ctx.storage.transaction(async (transaction) => {
-      const actionKey = `deposit:${input.actionKey}`;
-      const prior = await transaction.get<{ count: number }>(actionKey);
-      if (prior) return { accepted: true, duplicate: true, count: prior.count };
-      const current = (await transaction.get<number>("count")) || 0;
-      if (current >= PIT_CAPACITY) return { accepted: false, duplicate: false, count: current };
-      const next = current + 1;
-      await transaction.put("count", next);
-      await transaction.put(actionKey, { count: next });
+      const legacyKey = `deposit:${input.actionKey}`;
+      const actionKey = stoneKey ?? legacyKey;
+      const prior = await transaction.get<{ count: number; generation?: number }>(actionKey);
+      const saved = await transaction.get<PitState>("pit-state");
+      const current = isPitState(saved) ? saved : this.pit;
+      if (prior && (!stoneKey || (prior.generation ?? -1) >= generation!)) {
+        return { accepted: true, duplicate: true, count: prior.count, pit: current };
+      }
+      // A stone's generations only increase. Keeping its latest accepted
+      // generation bounds gameplay dedupe to the fixed stone pool per room.
+      // Older prototype keys are read once for continuity and never erased.
+      if (stoneKey) {
+        const legacy = await transaction.get<{ count: number }>(legacyKey);
+        if (legacy) {
+          await transaction.put(stoneKey, { count: legacy.count, generation });
+          return { accepted: true, duplicate: true, count: legacy.count, pit: current };
+        }
+      }
+      // All validated throws are accepted, including throws already in flight
+      // when another room completes the previous excavation.
+      const next = advancePitState(current);
+      await transaction.put("pit-state", next);
+      await transaction.put("count", next.count);
+      await transaction.put(actionKey, { count: next.count, ...(stoneKey ? { generation } : {}) });
+      if (next.round !== current.round) {
+        const monument = next.monuments[next.monuments.length - 1];
+        await transaction.put(`monument:${monument.round}`, monument);
+      }
       if (targetShards.length > 0) {
         await transaction.put(
           "pending-fanout-targets",
-          Object.fromEntries(targetShards.map((shard) => [String(shard), next])),
+          Object.fromEntries(targetShards.map((shard) => [String(shard), next.totalStones])),
         );
       }
-      return { accepted: true, duplicate: false, count: next };
+      return { accepted: true, duplicate: false, count: next.count, pit: next };
     });
-    // An idempotent retry returns the count recorded for that original action,
-    // which may be older than the current global count. Never regress the
-    // coordinator's in-memory snapshot.
-    this.count = Math.max(this.count, outcome.count);
+    // totalStones is monotonic across both deposits and excavation rollovers.
+    if (outcome.pit.totalStones >= this.pit.totalStones) this.pit = outcome.pit;
 
     if (outcome.accepted && !outcome.duplicate && targetShards.length > 0) {
-      for (const shard of targetShards) this.pendingFanoutTargets.set(shard, this.count);
+      for (const shard of targetShards) this.pendingFanoutTargets.set(shard, this.pit.totalStones);
       await this.scheduleFanoutAlarm(250);
-    } else if (outcome.accepted && this.pendingFanoutTargets.size > 0) {
-      // Recover the narrow crash window between persisting targets and arming
-      // the alarm when a client retries its already-committed action.
+    } else if (this.pendingFanoutTargets.size > 0) {
       await this.scheduleFanoutAlarm(250);
     }
-    return json({ ...outcome, capacity: PIT_CAPACITY });
+    return json({ ...outcome, capacity: outcome.pit.capacity });
   }
 
   async alarm() {
@@ -707,7 +733,7 @@ export class PitCoordinator extends DurableObject<Env> {
             const response = await fanout.fetch("https://fanout/pit-update", {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ count: targetCount, capacity: PIT_CAPACITY }),
+              body: JSON.stringify({ count: this.pit.count, capacity: this.pit.capacity, pit: this.pit }),
             });
             if (!response.ok) {
               failed.add(shardNumber);
@@ -809,14 +835,8 @@ export class PitFanout extends DurableObject<Env> {
         }),
       );
     }
-    if (update.count >= update.capacity) {
-      // This is the final monotonic update. Deliver it once, then release every
-      // successful subscription. Failed deliveries stay registered so the
-      // coordinator's alarm retry can complete them.
-      const delivered = roomIds.filter((roomId) => !failed.has(roomId));
-      for (const roomId of delivered) this.rooms.delete(roomId);
-      await this.deleteSubscriptions(delivered);
-    } else if (stale.length) {
+    // A completed excavation starts another; subscriptions survive rollover.
+    if (stale.length) {
       for (const roomId of stale) this.rooms.delete(roomId);
       await this.deleteSubscriptions(stale);
     }
@@ -837,10 +857,9 @@ export class PitFanout extends DurableObject<Env> {
 export class FieldRoom extends DurableObject<Env> {
   private roomId = "";
   private directoryId = "";
-  private pitCount = 0;
-  private pitCapacity = PIT_CAPACITY;
+  private pit = createInitialPitState();
   private pitSubscribed = false;
-  private pitSubscribePromise: Promise<{ count: number; capacity: number }> | null = null;
+  private pitSubscribePromise: Promise<PitState> | null = null;
   private pitRetryMs = 1_000;
   private pitRetryAt: number | null = null;
   private roomHintDirty = false;
@@ -871,7 +890,8 @@ export class FieldRoom extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       this.roomId = (await ctx.storage.get<string>("room-id")) || "";
       this.directoryId = (await ctx.storage.get<string>("directory-id")) || "";
-      this.pitCount = (await ctx.storage.get<number>("pit-count")) || 0;
+      const savedPit = await ctx.storage.get<PitState>("pit-state");
+      this.pit = isPitState(savedPit) ? savedPit : migrateLegacyPitState((await ctx.storage.get<number>("pit-count")) || 0);
       const savedPitRetryAt = await ctx.storage.get<number>("pit-retry-at");
       const savedPitRetryMs = await ctx.storage.get<number>("pit-retry-ms");
       this.pitRetryAt = Number.isFinite(savedPitRetryAt)
@@ -958,22 +978,11 @@ export class FieldRoom extends DurableObject<Env> {
       return this.enqueueRoomTask(() => this.connectWebSocket(request));
     }
     if (url.pathname === "/pit-update" && request.method === "POST") {
-      const update = (await request.json()) as { count: number; capacity: number };
+      const update = (await request.json()) as { count: number; capacity: number; pit?: PitState };
       const active = this.activeCount();
-      // Fanout removes a room that reports zero active sockets, so it must not
-      // retain a false-positive subscription flag afterward.
       this.pitSubscribed = active > 0;
-      // Counts are monotonic. A delayed retry for an older target can arrive
-      // after this room already learned a newer count from its own deposit.
-      this.pitCapacity = Number.isFinite(update.capacity)
-        ? Math.max(1, Math.trunc(update.capacity))
-        : this.pitCapacity;
-      const incomingCount = Number.isFinite(update.count)
-        ? Math.max(0, Math.min(this.pitCapacity, Math.trunc(update.count)))
-        : this.pitCount;
-      this.pitCount = Math.max(this.pitCount, incomingCount);
-      this.ctx.waitUntil(this.ctx.storage.put("pit-count", this.pitCount));
-      this.broadcast({ t: "pit", count: this.pitCount, capacity: this.pitCapacity });
+      await this.applyPitState(update);
+      this.broadcast({ t: "pit", count: this.pit.count, capacity: this.pit.capacity, pit: this.pit });
       return json({ active });
     }
     return json({ error: "not-found" }, 404);
@@ -1050,8 +1059,9 @@ export class FieldRoom extends DurableObject<Env> {
         return;
       }
       this.queuedActions += 1;
+      const actionPit = this.pit;
       const action = this.enqueueRoomTask(() =>
-        this.handleAction(socket, attachment.actorId, input),
+        this.handleAction(socket, attachment.actorId, input, actionPit),
       );
       try {
         await action;
@@ -1064,6 +1074,10 @@ export class FieldRoom extends DurableObject<Env> {
   }
 
   async webSocketClose(socket: CloudflareServerWebSocket) {
+    // Explicitly finish the close handshake as well as persisting departure.
+    // This is safe with the runtime's automatic close reply and helps local
+    // dev proxies release their TCP connection promptly.
+    try { socket.close(); } catch { /* The runtime may have already closed it. */ }
     await this.enqueueRoomTask(() => this.disconnect(socket));
   }
 
@@ -1220,10 +1234,13 @@ export class FieldRoom extends DurableObject<Env> {
       }
     }
 
+    await this.ensurePitSubscription().catch(async () => {
+      await this.schedulePitRetry();
+    });
     const occupied = [...this.players.values()]
       .filter((player) => player.id !== actorId && !player.sleeping)
       .map(({ x, z }) => ({ x, z }));
-    const spawn = safeSpawn(actorId, occupied);
+    const spawn = safeSpawn(actorId, occupied, this.pit);
     const now = Date.now();
     const player: StoredPlayer = prior
       ? {
@@ -1247,7 +1264,7 @@ export class FieldRoom extends DurableObject<Env> {
           z: spawn.z,
           vx: 0,
           vz: 0,
-          heading: headingTowardPit(spawn.x, spawn.z),
+          heading: headingTowardPit(spawn.x, spawn.z, this.pit),
           carrying: null,
           sleeping: false,
           lastMoveAt: now,
@@ -1262,10 +1279,6 @@ export class FieldRoom extends DurableObject<Env> {
     this.reservations.delete(actorId);
     await Promise.all([this.ctx.storage.put(`player:${actorId}`, player), this.persistReservations()]);
 
-    const pit = await this.ensurePitSubscription().catch(async () => {
-      await this.schedulePitRetry();
-      return { count: this.pitCount, capacity: this.pitCapacity };
-    });
     if (this.connections.get(actorId) !== connectionId) {
       return json({ error: "connection-superseded" }, 409);
     }
@@ -1280,8 +1293,9 @@ export class FieldRoom extends DurableObject<Env> {
       protocol: WORLD_PROTOCOL_VERSION,
       selfId: actorId,
       roomId: this.roomId,
-      count: pit.count,
-      capacity: pit.capacity,
+      count: this.pit.count,
+      capacity: this.pit.capacity,
+      pit: this.pit,
       players: this.welcomePlayers(player),
       stones: [...this.stones.values()],
       serverTime: now,
@@ -1305,7 +1319,7 @@ export class FieldRoom extends DurableObject<Env> {
     const player = this.players.get(actorId);
     if (!player || player.sleeping) return;
     const wasMoving = Math.hypot(player.vx, player.vz) >= 0.05;
-    const movement = validateMovement(player, message, now);
+    const movement = validateMovement(player, message, now, this.pit);
     if (!movement) return;
     Object.assign(player, movement, { lastSeenAt: now });
     this.dirtyPlayers.add(actorId);
@@ -1363,6 +1377,7 @@ export class FieldRoom extends DurableObject<Env> {
     socket: CloudflareServerWebSocket,
     actorId: string,
     input: Extract<ClientMessage, { t: "pickup" | "throw" }>,
+    actionPit: PitState = this.pit,
   ) {
     const id = sanitizeActionId(input.id);
     const stoneIndex = typeof input.stoneId === "string" ? parseStoneIndex(input.stoneId) : null;
@@ -1373,7 +1388,7 @@ export class FieldRoom extends DurableObject<Env> {
     }
     const cached = player.actionHistory.find((result) => result.id === id);
     if (cached) {
-      this.send(socket, cached);
+      this.send(socket, cached.kind === "throw" ? { ...cached, pit: this.pit } : cached);
       return;
     }
 
@@ -1403,42 +1418,37 @@ export class FieldRoom extends DurableObject<Env> {
       // accepted. A non-deposit must still land from the pose that initiated
       // this action, matching the browser's visible throw.
       const throwPose = { x: player.x, z: player.z, heading: player.heading };
-      const distanceFromPit = Math.hypot(player.x, player.z);
+      const distanceFromPit = Math.hypot(player.x - actionPit.center.x, player.z - actionPit.center.z);
       let deposited = false;
       let count: number | undefined;
       let reason: string | undefined;
-      if (distanceFromPit <= PIT_THROW_RADIUS && distanceFromPit >= PIT_WALL_RADIUS - 0.25) {
-        if (this.pitCount >= this.pitCapacity) {
-          count = this.pitCount;
-          reason = "pit-full";
-        } else {
-          const pit = this.env.PIT.get(this.env.PIT.idFromName("global-pit"));
-          try {
-            const response = await pit.fetch("https://pit/deposit", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                actionKey: `${this.roomId}:${stone.id}:${stone.generation}`,
-              }),
-            });
-            if (response.ok) {
-              const outcome = (await response.json()) as { accepted: boolean; count: number };
-              deposited = outcome.accepted;
-              count = outcome.count;
-              if (Number.isFinite(count) && count > this.pitCount) {
-                this.pitCount = Math.min(this.pitCapacity, count);
-                this.ctx.waitUntil(this.ctx.storage.put("pit-count", this.pitCount));
-              }
-              if (!deposited) reason = "pit-full";
-            } else {
-              reason = "pit-unavailable";
-            }
-          } catch {
-            reason = "pit-unavailable";
-          }
+      if (distanceFromPit <= actionPit.throwRadius && distanceFromPit >= actionPit.wallRadius - 0.25) {
+        const coordinator = this.env.PIT.get(this.env.PIT.idFromName("global-pit"));
+        try {
+          const response = await coordinator.fetch("https://pit/deposit", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ actionKey: `${this.roomId}:${stone.id}:${stone.generation}` }),
+          });
+          if (response.ok) {
+            const outcome = (await response.json()) as { accepted: boolean; count: number; capacity?: number; pit?: PitState };
+            deposited = outcome.accepted;
+            count = outcome.count;
+            await this.applyPitState(outcome);
+            if (!deposited) reason = "pit-unavailable";
+          } else reason = "pit-unavailable";
+        } catch {
+          reason = "pit-unavailable";
         }
       } else {
         reason = "too-far-from-pit";
+      }
+
+      if (reason === "pit-unavailable") {
+        // Keep ownership when the coordinator is unavailable or its reply was
+        // lost. Retrying the same stone generation is idempotent globally.
+        this.send(socket, { t: "action", id, ok: false, kind: "throw", reason, pit: this.pit });
+        return;
       }
 
       // The global deposit await can interleave with a reconnect, which
@@ -1448,7 +1458,7 @@ export class FieldRoom extends DurableObject<Env> {
       player = this.players.get(actorId) ?? player;
       player.carrying = null;
       if (deposited) {
-        const descriptor = getStoneDescriptor(stoneIndex, stone.generation + 1);
+        const descriptor = getStoneDescriptor(stoneIndex, stone.generation + 1, this.pit);
         Object.assign(stone, {
           x: descriptor.x,
           z: descriptor.z,
@@ -1460,6 +1470,8 @@ export class FieldRoom extends DurableObject<Env> {
           throwPose.x,
           throwPose.z,
           throwPose.heading,
+          undefined,
+          this.pit,
         );
         Object.assign(stone, { x: dropped.x, z: dropped.z, holderId: null });
       }
@@ -1473,10 +1485,14 @@ export class FieldRoom extends DurableObject<Env> {
       for (const changed of changedActionStones.values()) {
         this.broadcast({ t: "stone", op: "upsert", stone: changed });
       }
-      result = { t: "action", id, ok: reason !== "pit-unavailable", kind: "throw", deposited, count, reason };
+      result = { t: "action", id, ok: reason !== "pit-unavailable", kind: "throw", deposited, count, reason, pit: this.pit };
     }
 
-    player.actionHistory = [...player.actionHistory.filter((entry) => entry.id !== id), result].slice(
+    // Keep cached acknowledgements small; the current pit snapshot is attached
+    // at send time, so replaying an old action cannot regress a client.
+    const cachedResult = { ...result };
+    delete cachedResult.pit;
+    player.actionHistory = [...player.actionHistory.filter((entry) => entry.id !== id), cachedResult].slice(
       -ACTION_HISTORY_LIMIT,
     );
     player.lastSeenAt = Date.now();
@@ -1605,7 +1621,7 @@ export class FieldRoom extends DurableObject<Env> {
   private createStones() {
     const stones: StoneState[] = [];
     for (let index = 0; index < FIELD_STONE_COUNT; index += 1) {
-      const descriptor = getStoneDescriptor(index);
+      const descriptor = getStoneDescriptor(index, 0, this.pit);
       stones.push({ id: descriptor.id, x: descriptor.x, z: descriptor.z, generation: 0, holderId: null });
     }
     return stones;
@@ -1617,7 +1633,7 @@ export class FieldRoom extends DurableObject<Env> {
     const recyclable: StoneState[] = [];
     for (const stone of this.stones.values()) {
       if (stone.holderId) continue;
-      if (isNearPitStonePosition(stone.x, stone.z)) nearbyCount += 1;
+      if (isNearPitStonePosition(stone.x, stone.z, this.pit)) nearbyCount += 1;
       else if (stone.id !== excludedStoneId) recyclable.push(stone);
     }
     if (nearbyCount >= MIN_NEAR_PIT_STONES) return [];
@@ -1634,6 +1650,7 @@ export class FieldRoom extends DurableObject<Env> {
       const descriptor = getStoneDescriptor(
         index,
         getNextNearbyStoneGeneration(stone.generation),
+        this.pit,
       );
       Object.assign(stone, {
         x: descriptor.x,
@@ -1768,7 +1785,7 @@ export class FieldRoom extends DurableObject<Env> {
 
   private async ensurePitSubscription() {
     if (this.pitSubscribed) {
-      return { count: this.pitCount, capacity: this.pitCapacity };
+      return this.pit;
     }
     if (this.pitSubscribePromise) return this.pitSubscribePromise;
     this.pitSubscribePromise = this.subscribePit();
@@ -1790,14 +1807,41 @@ export class FieldRoom extends DurableObject<Env> {
       body: JSON.stringify({ roomId: this.roomId }),
     });
     if (!response.ok) throw new Error("pit-subscribe-failed");
-    const state = (await response.json()) as { count: number; capacity: number };
-    this.pitCapacity = Math.max(1, Math.trunc(state.capacity));
-    this.pitCount = Math.max(
-      this.pitCount,
-      Math.max(0, Math.min(this.pitCapacity, Math.trunc(state.count))),
-    );
-    await this.ctx.storage.put("pit-count", this.pitCount);
-    return { count: this.pitCount, capacity: this.pitCapacity };
+    const state = (await response.json()) as PitState;
+    await this.applyPitState(state);
+    return this.pit;
+  }
+
+  private async applyPitState(update: { count: number; capacity?: number; pit?: PitState }) {
+    const incoming = isPitState(update) ? update : isPitState(update.pit) ? update.pit : migrateLegacyPitState(update.count, this.pit.startedAt);
+    if (incoming.totalStones < this.pit.totalStones) return;
+    const moved = incoming.round !== this.pit.round;
+    this.pit = incoming;
+    const records: Record<string, unknown> = { "pit-state": this.pit, "pit-count": this.pit.count };
+    if (moved) {
+      // Keep every visitor outside the new excavation, including someone who
+      // happened to be standing where it appeared.
+      for (const player of this.players.values()) {
+        const safe = clampPositionOutsidePit(player.x, player.z, this.pit);
+        if (safe.x !== player.x || safe.z !== player.z) {
+          Object.assign(player, safe, { vx: 0, vz: 0 });
+          records[`player:${player.id}`] = player;
+          this.dirtyPlayers.add(player.id);
+        }
+      }
+      for (const stone of this.stones.values()) {
+        if (stone.holderId) continue;
+        const index = parseStoneIndex(stone.id);
+        if (index === null) continue;
+        const descriptor = getStoneDescriptor(index, stone.generation + 1, this.pit);
+        Object.assign(stone, { x: descriptor.x, z: descriptor.z, generation: descriptor.generation });
+        records[`stone:${stone.id}`] = stone;
+        this.broadcast({ t: "stone", op: "upsert", stone });
+      }
+      this.scheduleFrame();
+      this.broadcast({ t: "pit", count: this.pit.count, capacity: this.pit.capacity, pit: this.pit });
+    }
+    await putStorageRecords(this.ctx.storage, records);
   }
 
   private async unsubscribePit() {

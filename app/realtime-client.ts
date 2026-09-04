@@ -8,6 +8,8 @@
  * details, and the anonymous resume token stored on this device.
  */
 
+import { isPitState, migrateLegacyPitState, type PitState } from "../shared/world.ts";
+
 export const REALTIME_PROTOCOL_VERSION = 1 as const;
 export const MAX_MOVEMENT_RATE_HZ = 8 as const;
 
@@ -42,9 +44,9 @@ export interface RealtimeStatus {
 }
 
 export interface RealtimeProfileInput {
-  name: string;
-  city: string;
-  countryCode: string;
+  name?: string;
+  city?: string;
+  countryCode?: string;
   countryFlag?: string;
   waitReason?: string;
   reasonId?: string;
@@ -106,6 +108,7 @@ export interface RealtimeStone {
 }
 
 export interface WelcomeMessage {
+  pit: PitState;
   t: "welcome";
   protocol: number;
   selfId: string;
@@ -139,12 +142,14 @@ export interface StoneMessage {
 }
 
 export interface PitMessage {
+  pit: PitState;
   t: "pit";
   count: number;
   capacity: number;
 }
 
 export interface ActionResultMessage {
+  pit?: PitState;
   t: "action";
   id: string;
   ok: boolean;
@@ -280,22 +285,22 @@ function compactText(value: string, maxLength: number) {
 
 function flagFromCountryCode(countryCode: string) {
   const normalized = countryCode.trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(normalized)) return "🌍";
+  if (!/^[A-Z]{2}$/.test(normalized) || normalized === "XX") return "";
   return String.fromCodePoint(
     ...Array.from(normalized).map((letter) => 127397 + letter.charCodeAt(0)),
   );
 }
 
 function normalizeProfile(profile: RealtimeProfileInput): RealtimeProfile {
-  const countryCode = compactText(profile.countryCode, 2).toUpperCase();
+  const countryCode = compactText(profile.countryCode ?? "", 2).toUpperCase();
   return {
-    name: compactText(profile.name, 24) || "Someone",
-    city: compactText(profile.city, 60) || "Somewhere",
-    countryCode: /^[A-Z]{2}$/.test(countryCode) ? countryCode : "XX",
+    name: compactText(profile.name ?? "", 24),
+    city: compactText(profile.city ?? "", 32),
+    countryCode: /^[A-Z]{2}$/.test(countryCode) ? countryCode : "",
     countryFlag: compactText(profile.countryFlag ?? "", 8) || flagFromCountryCode(countryCode),
     waitReason:
-      compactText(profile.waitReason ?? profile.reasonText ?? profile.reasonId ?? "waiting", 50) ||
-      "waiting",
+      compactText(profile.waitReason ?? profile.reasonText ?? profile.reasonId ?? "Just waiting", 60) ||
+      "Just waiting",
   };
 }
 
@@ -508,7 +513,17 @@ function canonicalMessage(value: unknown): ServerMessage | undefined {
   };
   const t = aliases[rawType] ?? rawType;
   const nested = isObject(value.data) ? value.data : undefined;
-  return { ...(nested ?? {}), ...value, t } as ServerMessage;
+  const message: Record<string, unknown> & { t: string } = { ...(nested ?? {}), ...value, t };
+  if (t === "welcome" || t === "pit" || (t === "action" && "pit" in message)) {
+    if ("pit" in message && message.pit !== undefined) {
+      if (!isPitState(message.pit)) return undefined;
+    } else if ((t === "welcome" || t === "pit") && Number.isSafeInteger(message.count) && (message.count as number) >= 0) {
+      message.pit = migrateLegacyPitState(message.count as number);
+    } else return undefined;
+    const pit = message.pit as PitState;
+    if (t !== "action") Object.assign(message, { count: pit.count, capacity: pit.capacity });
+  }
+  return message as ServerMessage;
 }
 
 export async function loadMultiplayerConfig(

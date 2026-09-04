@@ -7,6 +7,12 @@ import {
   STONE_THROW_DISTANCE,
   WALK_SPEED,
   clampPositionOutsidePit,
+  createInitialPitState,
+  advancePitState,
+  isPitState,
+  getPitLayout,
+  getPitCapacity,
+  RECENT_MONUMENT_LIMIT,
   getForwardStonePosition,
   getNextNearbyStoneGeneration,
   getStoneDescriptor,
@@ -20,6 +26,7 @@ import {
   sanitizeActionId,
   sanitizeChat,
   sanitizeProfile,
+  safeSpawn,
   validateMovement,
 } from "../src/domain.ts";
 import type { StoredPlayer } from "../src/types.ts";
@@ -216,4 +223,51 @@ test("action ids only admit compact opaque identifiers", () => {
   assert.equal(sanitizeActionId("action_123-A"), "action_123-A");
   assert.equal(sanitizeActionId("not valid"), null);
   assert.equal(sanitizeActionId("x".repeat(49)), null);
+});
+
+
+test("a reason-only visitor never receives an invented name or location", () => {
+  assert.deepEqual(sanitizeProfile({ waitReason: "  My   coffee  " }), {
+    name: "", city: "", countryCode: "", countryFlag: "", waitReason: "My coffee",
+  });
+  assert.equal(sanitizeProfile({ waitReason: "x".repeat(100) }).waitReason.length, 60);
+});
+
+test("local and authoritative pits share dated rollover rules and bounded recent monuments", () => {
+  let pit = createInitialPitState(1_000);
+  for (let round = 1; round <= 12; round += 1) {
+    const previous = pit;
+    pit = { ...pit, count: pit.capacity - 1, totalStones: pit.totalStones + pit.capacity - 1 };
+    pit = advancePitState(pit, 1_000 + round * 100);
+    assert.equal(pit.round, round + 1);
+    assert.equal(pit.count, 0);
+    assert.equal(pit.capacity, getPitCapacity(round + 1));
+    assert.ok(pit.radius > previous.radius);
+    assert.ok(pit.center.x - previous.center.x > pit.wallRadius + previous.wallRadius);
+    assert.equal(pit.monuments.at(-1)?.stoneCount, previous.capacity);
+    assert.equal(pit.monuments.at(-1)?.completedAt, 1_000 + round * 100);
+    assert.equal(isPitState(pit), true);
+  }
+  assert.equal(pit.monuments.length, RECENT_MONUMENT_LIMIT);
+  assert.equal(pit.monuments[0].round, 5);
+});
+
+test("pit validation rejects impossible counts, geometry, dates and monument payloads", () => {
+  const pit = createInitialPitState(1_000);
+  for (const bad of [
+    { ...pit, count: 100 }, { ...pit, round: -1 }, { ...pit, radius: NaN },
+    { ...pit, count: 0.5 }, { ...pit, center: { x: 0, z: Infinity } },
+    { ...pit, totalStones: 1 }, { ...pit, startedAt: -1 },
+    { ...pit, monuments: [null] },
+  ]) assert.equal(isPitState(bad), false);
+});
+
+test("stone generation and safe spawns follow the active pit in later rounds", () => {
+  const pit = getPitLayout(5);
+  const stone = getStoneDescriptor(0, 1, pit);
+  assert.equal(isNearPitStonePosition(stone.x, stone.z, pit), true);
+  const safe = clampPositionOutsidePit(pit.center.x, pit.center.z, pit);
+  assert.ok(Math.hypot(safe.x - pit.center.x, safe.z - pit.center.z) >= pit.wallRadius);
+  const spawn = safeSpawn("someone-new", [], pit);
+  assert.ok(Math.hypot(spawn.x - pit.center.x, spawn.z - pit.center.z) < pit.throwRadius);
 });

@@ -263,17 +263,13 @@ test("a failed authored load leaves the visible fallback untouched", async () =>
   assert.equal(fallback.parent, parent);
 });
 
-test("the live scene has no statue visual or statue asset path", async () => {
+test("the rebuilt meadow reaches first interaction without authored environment downloads", async () => {
   const sceneSource = await readFile(
-    new URL("../app/waiting-pit.tsx", import.meta.url),
+    new URL("../app/world-art.ts", import.meta.url),
     "utf8",
   );
-  const manifestSource = await readFile(
-    new URL("../app/environment/environment-manifest.ts", import.meta.url),
-    "utf8",
-  );
-  assert.doesNotMatch(sceneSource, /statue/i);
-  assert.doesNotMatch(manifestSource, /statue/i);
+  assert.doesNotMatch(sceneSource, /loadEnvironmentAsset|TextureLoader|GLTFLoader/);
+  assert.match(sceneSource, /monumentPlaque/);
 });
 
 test("an aborted in-flight environment load cannot install or leak its late GLB", async () => {

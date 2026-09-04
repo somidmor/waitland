@@ -1,4 +1,4 @@
-import type { StoneDescriptor } from "../../shared/world.ts";
+import type { PitState, StoneDescriptor } from "../../shared/world.ts";
 
 export type Env = Cloudflare.Env;
 
@@ -34,6 +34,7 @@ export type ActionResult = {
   reason?: string;
   deposited?: boolean;
   count?: number;
+  pit?: PitState;
 };
 
 export type StoredPlayer = PublicPlayer & {

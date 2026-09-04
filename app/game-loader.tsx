@@ -69,19 +69,10 @@ export default function GameLoader() {
     window.requestAnimationFrame(() => editTriggerRef.current?.focus());
   }
 
-  if (!isClient) {
-    return (
-      <main className="loading-shell" aria-label="Opening Waitland">
-        <span className="loading-pit" aria-hidden="true" />
-        <p>Opening the field…</p>
-      </main>
-    );
-  }
-
   if (!activeProfile) {
     return (
       <ArrivalScreen
-        key="arrival"
+        key={rememberedProfile ? "arrival-returning" : "arrival-new"}
         initialProfile={rememberedProfile}
         mode="arrival"
         onComplete={completeArrival}
@@ -123,7 +114,8 @@ export default function GameLoader() {
     return (
       <main className="loading-shell" aria-label="The field could not open">
         <span className="loading-pit" aria-hidden="true" />
-        <p>Couldn’t open the field.</p>
+        <h1>A small pause.</h1>
+        <p>The field couldn’t load. Let’s give it another try.</p>
         <button
           type="button"
           className="loading-retry"
@@ -134,6 +126,7 @@ export default function GameLoader() {
         >
           Try again
         </button>
+        <button className="loading-back" type="button" onClick={() => setActiveProfile(null)}>Go back</button>
       </main>
     );
   }
@@ -141,7 +134,7 @@ export default function GameLoader() {
   return (
     <main className="loading-shell" aria-label="Opening Waitland">
       <span className="loading-pit" aria-hidden="true" />
-      <p>Entering the field…</p>
+      <p>A little room for your wait…</p>
     </main>
   );
 }

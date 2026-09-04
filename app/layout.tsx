@@ -3,11 +3,11 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://waitland.app"),
-  title: "Waitland",
-  description: "Arrive from anywhere, wander the field, and carry one stone to the pit while you wait.",
+  title: "Waitland — A little wait. Something lasting.",
+  description: "Waiting for something? Pick up a rock, toss it in the shared pit, and help strangers build a monument. No accounts. Just a little of your time.",
   openGraph: {
-    title: "Waitland",
-    description: "Arrive. Wander. Carry one stone to the pit.",
+    title: "Waitland — A little wait. Something lasting.",
+    description: "Pick up a rock. Toss it in the pit. Together, turn the waiting into a monument.",
     url: "/",
     siteName: "Waitland",
     type: "website",
@@ -16,14 +16,14 @@ export const metadata: Metadata = {
         url: "/og.png",
         width: 1200,
         height: 630,
-        alt: "A lone person carrying a stone toward the central pit in Waitland",
+        alt: "Waitland, a shared little world where waiting becomes a monument",
       },
     ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "Waitland",
-    description: "Arrive. Wander. Carry one stone to the pit.",
+    title: "Waitland — A little wait. Something lasting.",
+    description: "Pick up a rock. Toss it in the pit. Together, turn the waiting into a monument.",
     images: ["/og.png"],
   },
   icons: {
@@ -36,7 +36,7 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
-  themeColor: "#c6a86e",
+  themeColor: "#f5f1e7",
 };
 
 export default function RootLayout({

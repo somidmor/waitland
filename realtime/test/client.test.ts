@@ -1,3 +1,4 @@
+import { createInitialPitState, advancePitState } from "../../shared/world.ts";
 import assert from "node:assert/strict";
 import test, { afterEach, beforeEach } from "node:test";
 import {
@@ -393,5 +394,30 @@ test("a rate-limited session honors Retry-After instead of retrying rapidly", as
   assert.ok((client.status.retryInMs ?? 0) >= 9_000);
   assert.equal(errors.at(-1)?.code, "session_rate_limited");
   assert.equal(statuses.at(-1)?.state, "offline");
+  client.destroy();
+});
+
+
+test("the client validates lifecycle geometry and accepts reason-only entry", async () => {
+  const statuses: RealtimeConnectionState[] = [];
+  const client = new RealtimeClient({
+    profile: { waitReason: "Coffee" },
+    fetchImpl: serviceFetch() as typeof fetch,
+    webSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+    onStatus: (status) => statuses.push(status.state),
+  });
+  const pits: number[] = [];
+  client.on("pit", (message) => pits.push(message.pit.round));
+  await client.start();
+  const socket = FakeWebSocket.instances.at(-1)!;
+  socket.open();
+  socket.message({ ...welcome(), pit: createInitialPitState() });
+  let pit = { ...createInitialPitState(), count: 99, totalStones: 99 };
+  pit = advancePitState(pit);
+  socket.message({ t: "pit", count: pit.count, capacity: pit.capacity, pit });
+  socket.message({ t: "pit", count: 0, capacity: 200, pit: { ...pit, center: { x: 26, z: 10 } } });
+  socket.message({ t: "pit", count: 0, capacity: 200, pit: { ...pit, monuments: [{ bad: true }] } });
+  assert.deepEqual(pits, [2]);
+  assert.equal(client.status.state, "online");
   client.destroy();
 });

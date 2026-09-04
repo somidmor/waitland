@@ -27,7 +27,12 @@ test("renders Waitland production metadata without host-specific markers", async
     /^text\/html\b/i,
   );
   const html = await response.text();
-  assert.match(html, /<title>Waitland<\/title>/i);
-  assert.match(html, /<meta[^>]+name=["']description["'][^>]+content=["'][^"']*wander the field/i);
+  assert.match(html, /<title>Waitland[^<]*A little wait\. Something lasting\.<\/title>/i);
+  assert.match(html, /<meta[^>]+name=["']description["'][^>]+content=["'][^"']*shared pit/i);
+  assert.match(html, /What are you waiting for\?/);
+  assert.match(html, /No accounts\. Just a little of your time\./);
+  assert.match(html, /name="reason"/);
+  assert.doesNotMatch(html, /name="(?:city|country|email|password)"/);
+  assert.doesNotMatch(html, /Opening the field/);
   assert.doesNotMatch(html, /codex-preview|chatgpt\.site/i);
 });

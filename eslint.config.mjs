@@ -14,6 +14,8 @@ const eslintConfig = defineConfig([
     "dist/**",
     ".wrangler/**",
     "realtime/.wrangler/**",
+    "output/**",
+    ".playwright-cli/**",
     "next-env.d.ts",
   ]),
 ]);

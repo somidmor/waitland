@@ -1,133 +1,53 @@
 import * as THREE from "three";
-import type {
-  EnvironmentAssetLease,
-  EnvironmentInstancedPool,
-} from "./environment/environment-asset-runtime.ts";
-import { loadEnvironmentAsset } from "./environment/environment-asset-runtime.ts";
-import { WAITLAND_ENVIRONMENT_MANIFEST } from "./environment/environment-manifest.ts";
 import {
+  createInitialPitState,
+  PIT_RADIUS,
+  type PitMonument,
+  type PitState,
+  type StoneDescriptor,
+} from "../shared/world.ts";
+import {
+  createPitFloorGeometry,
+  createPitLipGeometry,
+  createPitTurfGeometry,
+  createPitWallGeometry,
   PIT_EDGE_SEGMENTS,
   PIT_LIP_OUTER_PHASE,
   PIT_LIP_OUTER_RADIUS,
   pitEdgeRadius,
 } from "./pit-geometry.ts";
 
-type Disposable = { dispose: () => void };
-
-export const ENVIRONMENT_TEXTURE_PATHS = {
-  grass: {
-    baseColor: "/assets/environment/v1/meadow-grass-albedo.jpg",
-    // Optional future linear channels: meadow-grass-normal.png and
-    // meadow-grass-roughness.png. Keep null until those files are authored.
-    normal: null,
-    roughness: null,
-  },
-  pit: {
-    baseColor: "/assets/environment/v1/pit-earth-albedo.jpg",
-    // Optional future linear channels: pit-earth-normal.png and
-    // pit-earth-roughness.png. Albedo must never be reused as either channel.
-    normal: null,
-    roughness: null,
-  },
+/** One deliberately small palette keeps the action legible on a phone. */
+export const WORLD_COLORS = {
+  sky: 0xdde6d4,
+  grass: 0xa8c19a,
+  grassDark: 0x8fa988,
+  leaf: 0x78957c,
+  leafLight: 0x97b092,
+  bark: 0x9e937a,
+  earth: 0xb0a185,
+  pit: 0x46543d,
+  stone: [0xd3c8b4, 0xbeb8a6, 0xe0d3bc, 0xaaa994],
+  gold: 0xe8c77c,
 } as const;
 
-type EnvironmentTexturePaths =
-  (typeof ENVIRONMENT_TEXTURE_PATHS)[keyof typeof ENVIRONMENT_TEXTURE_PATHS];
+type Disposable = { dispose(): void };
+type StoneMesh = THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial>;
 
-export type EnvironmentMaterialTarget = {
-  material: THREE.MeshStandardMaterial;
-  texturedColor?: THREE.ColorRepresentation;
+export type WaitingWorld = {
+  root: THREE.Group;
+  ground: THREE.Mesh;
+  pitTarget: THREE.Mesh;
+  stones: Map<string, StoneMesh>;
+  setStone(descriptor: StoneDescriptor, visible?: boolean): StoneMesh;
+  setPit(pit: PitState): void;
+  highlightStone(id: string | null): void;
+  burst(x: number, z: number, kind?: "deposit" | "monument"): void;
+  update(elapsedSeconds: number, playerX?: number, playerZ?: number): void;
+  dispose(): void;
 };
 
-export type EnvironmentTextureBinding = Disposable;
-
-/**
- * Adds an optional tileable material set without weakening the solid-colour
- * fallback. Available channels are shared by every target, loaded only in a
- * browser, and applied together so a missing file never produces a black mesh.
- */
-export function attachEnvironmentMaterialTextures(
-  targets: readonly EnvironmentMaterialTarget[],
-  paths: EnvironmentTexturePaths,
-  options: { repeat: number; normalScale: number },
-): EnvironmentTextureBinding {
-  let disposed = false;
-  const textures = new Set<THREE.Texture>();
-
-  if (typeof document === "undefined") {
-    return { dispose: () => undefined };
-  }
-
-  const loader = new THREE.TextureLoader();
-  const load = async (path: string, colorSpace: THREE.ColorSpace) => {
-    try {
-      const texture = await loader.loadAsync(path);
-      texture.wrapS = THREE.RepeatWrapping;
-      texture.wrapT = THREE.RepeatWrapping;
-      texture.repeat.setScalar(options.repeat);
-      texture.colorSpace = colorSpace;
-      texture.anisotropy = 2;
-      texture.magFilter = THREE.LinearFilter;
-      texture.minFilter = THREE.LinearMipmapLinearFilter;
-      texture.generateMipmaps = true;
-      texture.needsUpdate = true;
-      return texture;
-    } catch {
-      return null;
-    }
-  };
-  const loadOptional = (path: string | null, colorSpace: THREE.ColorSpace) =>
-    path ? load(path, colorSpace) : Promise.resolve(null);
-
-  void Promise.all([
-    load(paths.baseColor, THREE.SRGBColorSpace),
-    loadOptional(paths.normal, THREE.NoColorSpace),
-    loadOptional(paths.roughness, THREE.NoColorSpace),
-  ]).then(([baseColor, normal, roughness]) => {
-    const loaded = [baseColor, normal, roughness].filter(
-      (texture): texture is THREE.Texture => texture !== null,
-    );
-    if (disposed) {
-      loaded.forEach((texture) => texture.dispose());
-      return;
-    }
-
-    loaded.forEach((texture) => textures.add(texture));
-    for (const target of targets) {
-      if (baseColor) {
-        target.material.map = baseColor;
-        if (target.texturedColor !== undefined) {
-          target.material.color.set(target.texturedColor);
-        }
-      }
-      if (normal) {
-        target.material.normalMap = normal;
-        target.material.normalScale.setScalar(options.normalScale);
-      }
-      if (roughness) target.material.roughnessMap = roughness;
-      if (loaded.length > 0) target.material.needsUpdate = true;
-    }
-  });
-
-  return {
-    dispose() {
-      disposed = true;
-      textures.forEach((texture) => texture.dispose());
-      textures.clear();
-    },
-  };
-}
-
-export type StorybookWorld = {
-  /**
-   * Player coordinates are optional for the first frame, but callers should
-   * pass them every frame so the bounded scenery pool follows long journeys.
-   */
-  update: (elapsedSeconds: number, playerX?: number, playerZ?: number) => void;
-  dispose: () => void;
-};
-
-function seededRandom(seed = 0x57414954) {
+function randomSequence(seed: number) {
   let state = seed >>> 0;
   return () => {
     state = (state + 0x6d2b79f5) >>> 0;
@@ -138,1010 +58,590 @@ function seededRandom(seed = 0x57414954) {
   };
 }
 
-function setInstance(
-  mesh: THREE.InstancedMesh,
-  index: number,
-  object: THREE.Object3D,
-  x: number,
-  y: number,
-  z: number,
-  scaleX: number,
-  scaleY: number,
-  scaleZ: number,
-  rotationY = 0,
-) {
-  object.position.set(x, y, z);
-  object.scale.set(scaleX, scaleY, scaleZ);
-  object.rotation.set(0, rotationY, 0);
-  object.updateMatrix();
-  mesh.setMatrixAt(index, object.matrix);
-}
-
-function makePathRibbonGeometry(
-  curve: THREE.CatmullRomCurve3,
-  widths: readonly number[],
-  widthScale: number,
-  y: number,
-  includeColor: boolean,
-) {
-  const segments = 64;
-  const positions: number[] = [];
-  const colors: number[] = [];
-  const indices: number[] = [];
-  const point = new THREE.Vector3();
-  const tangent = new THREE.Vector3();
-  const normal = new THREE.Vector3();
-  const warmSoil = new THREE.Color(0x9a845e);
-  const wornSoil = new THREE.Color(0x85724f);
-  const shade = new THREE.Color();
-
-  for (let index = 0; index <= segments; index += 1) {
-    const t = index / segments;
-    curve.getPointAt(t, point);
-    curve.getTangentAt(t, tangent);
-    normal.set(-tangent.z, 0, tangent.x).normalize();
-
-    const widthPosition = t * (widths.length - 1);
-    const widthIndex = Math.min(widths.length - 2, Math.floor(widthPosition));
-    const width = THREE.MathUtils.lerp(
-      widths[widthIndex],
-      widths[widthIndex + 1],
-      widthPosition - widthIndex,
-    );
-    const leftWidth = width * widthScale * (1 + Math.sin(index * 1.71) * 0.055);
-    const rightWidth = width * widthScale * (1 + Math.cos(index * 1.37) * 0.05);
-    const ripple = Math.sin(index * 0.83) * 0.002;
-
-    positions.push(
-      point.x + normal.x * leftWidth,
-      y + ripple,
-      point.z + normal.z * leftWidth,
-      point.x - normal.x * rightWidth,
-      y - ripple,
-      point.z - normal.z * rightWidth,
-    );
-
-    if (includeColor) {
-      shade.copy(warmSoil).lerp(wornSoil, 0.16 + (Math.sin(index * 0.91) + 1) * 0.11);
-      colors.push(shade.r, shade.g, shade.b, shade.r, shade.g, shade.b);
-    }
-
-    if (index < segments) {
-      const vertex = index * 2;
-      indices.push(vertex, vertex + 2, vertex + 1, vertex + 1, vertex + 2, vertex + 3);
-    }
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  if (includeColor) {
-    geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-  }
-  geometry.setIndex(indices);
-  geometry.computeVertexNormals();
-  geometry.computeBoundingSphere();
-  return geometry;
-}
-
-function isNearPath(x: number, z: number, samples: readonly THREE.Vector3[], clearance: number) {
-  const clearanceSquared = clearance * clearance;
-  for (const sample of samples) {
-    const dx = x - sample.x;
-    const dz = z - sample.z;
-    if (dx * dx + dz * dz < clearanceSquared) return true;
-  }
-  return false;
-}
-
-// Seven-by-seven chunks cover the full fog range, while all decoration remains
-// a handful of bounded instanced draw calls. New rows are populated under fog
-// as the player crosses a chunk boundary and old rows are recycled.
-const WORLD_CHUNK_SIZE = 42;
-const WORLD_CHUNK_RADIUS = 3;
-const WORLD_CHUNK_DIAMETER = WORLD_CHUNK_RADIUS * 2 + 1;
-const WORLD_CHUNK_COUNT = WORLD_CHUNK_DIAMETER * WORLD_CHUNK_DIAMETER;
-const PIT_MEADOW_CLEARANCE = PIT_LIP_OUTER_RADIUS + 0.2;
-const CENTRAL_PIT_OPENING_SCALE = 0.94;
-
-const PATCHES_PER_CHUNK = 3;
-const GRASS_MARKS_PER_CHUNK = 480;
-const FLOWERS_PER_CHUNK = 22;
-const TREES_PER_CHUNK = 1;
-const BUSHES_PER_CHUNK = 2;
-const ROCKS_PER_CHUNK = 2;
-
-const AUTHORED_PATH_MODULES = 15;
-
-type AuthoredEnvironmentKey = keyof typeof WAITLAND_ENVIRONMENT_MANIFEST.assets;
-
-type InstalledEnvironmentAsset = {
-  lease: EnvironmentAssetLease;
-  pool: EnvironmentInstancedPool;
-};
-
-function mixSeed(value: number) {
-  let next = value | 0;
-  next = Math.imul(next ^ (next >>> 16), 0x21f0aaad);
-  next = Math.imul(next ^ (next >>> 15), 0x735a2d97);
-  return (next ^ (next >>> 15)) >>> 0;
-}
-
-function seedForChunk(chunkX: number, chunkZ: number, salt: number) {
-  return mixSeed(
-    Math.imul(chunkX | 0, 0x1f123bb5) ^
-      Math.imul(chunkZ | 0, 0x5f356495) ^
-      salt,
-  );
-}
-
-function chunkAt(value: number) {
-  return Math.floor((value + WORLD_CHUNK_SIZE / 2) / WORLD_CHUNK_SIZE);
-}
-
-export function createCentralMeadowGeometry() {
-  const half = WORLD_CHUNK_SIZE / 2 + 0.06;
+/** A real opening, so recessed rocks and the inner wall are never hidden. */
+function meadowGeometry(pit: Pick<PitState, "center" | "radius">, originX = 0, originZ = 0, extent = 384) {
   const shape = new THREE.Shape();
-  shape.moveTo(-half, -half);
-  shape.lineTo(half, -half);
-  shape.lineTo(half, half);
-  shape.lineTo(-half, half);
+  shape.moveTo(originX - extent, -originZ - extent);
+  shape.lineTo(originX + extent, -originZ - extent);
+  shape.lineTo(originX + extent, -originZ + extent);
+  shape.lineTo(originX - extent, -originZ + extent);
   shape.closePath();
-
-  const opening = new THREE.Path();
-  opening.moveTo(
-    pitEdgeRadius(0, PIT_LIP_OUTER_RADIUS, PIT_LIP_OUTER_PHASE) *
-      1.035 *
-      CENTRAL_PIT_OPENING_SCALE,
-    0,
-  );
-  for (let index = 1; index <= PIT_EDGE_SEGMENTS; index += 1) {
-    const wrapped = (PIT_EDGE_SEGMENTS - index) % PIT_EDGE_SEGMENTS;
-    const angle = -(index / PIT_EDGE_SEGMENTS) * Math.PI * 2;
-    const radius = pitEdgeRadius(
-      wrapped,
-      PIT_LIP_OUTER_RADIUS,
-      PIT_LIP_OUTER_PHASE,
-    );
-    opening.lineTo(
-      Math.cos(angle) * radius * 1.035 * CENTRAL_PIT_OPENING_SCALE,
-      Math.sin(angle) * radius * CENTRAL_PIT_OPENING_SCALE,
-    );
+  const scale = pit.radius / PIT_RADIUS;
+  const holeExtent = (PIT_LIP_OUTER_RADIUS + 0.4) * scale;
+  if (Math.abs(pit.center.x - originX) + holeExtent < extent && Math.abs(pit.center.z - originZ) + holeExtent < extent) {
+    const hole = new THREE.Path();
+    for (let index = 0; index <= PIT_EDGE_SEGMENTS; index += 1) {
+      const wrapped = index % PIT_EDGE_SEGMENTS;
+      const angle = wrapped / PIT_EDGE_SEGMENTS * Math.PI * 2;
+      const radius = pitEdgeRadius(wrapped, PIT_LIP_OUTER_RADIUS, PIT_LIP_OUTER_PHASE) * scale;
+      const x = pit.center.x + Math.cos(angle) * radius * 1.035;
+      const z = pit.center.z + Math.sin(angle) * radius;
+      if (index === 0) hole.moveTo(x, -z);
+      else hole.lineTo(x, -z);
+    }
+    hole.closePath();
+    shape.holes.push(hole);
   }
-  opening.closePath();
-  shape.holes.push(opening);
-
-  const geometry = new THREE.ShapeGeometry(shape, 48);
+  const geometry = new THREE.ShapeGeometry(shape, PIT_EDGE_SEGMENTS);
   geometry.rotateX(-Math.PI / 2);
+  geometry.translate(0, -0.022, 0);
   const positions = geometry.getAttribute("position");
-  const uvs = new Float32Array(positions.count * 2);
+  const uv = geometry.getAttribute("uv");
   for (let index = 0; index < positions.count; index += 1) {
-    uvs[index * 2] = (positions.getX(index) + half) / (half * 2);
-    uvs[index * 2 + 1] = (positions.getZ(index) + half) / (half * 2);
+    uv.setXY(index, (positions.getX(index) - originX + extent) / (extent * 2), (positions.getZ(index) - originZ + extent) / (extent * 2));
   }
-  geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-  geometry.computeVertexNormals();
   geometry.computeBoundingBox();
+  geometry.name = "waitland-meadow-with-pit-opening";
   return geometry;
 }
 
-type ChunkPoint = { x: number; z: number; visible: boolean };
+/** Retained for tools that preview the shared pit geometry in isolation. */
+export function createCentralMeadowGeometry() {
+  return meadowGeometry(createInitialPitState(), 0, 0, 21);
+}
+
+function shadowTexture() {
+  if (typeof document === "undefined") return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const context = canvas.getContext("2d");
+  if (!context) return null;
+  const gradient = context.createRadialGradient(32, 32, 2, 32, 32, 31);
+  gradient.addColorStop(0, "rgba(45,61,39,0.32)");
+  gradient.addColorStop(0.55, "rgba(45,61,39,0.14)");
+  gradient.addColorStop(1, "rgba(45,61,39,0)");
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, 64, 64);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+function monumentPlaque(monument: PitMonument) {
+  const date = new Date(monument.completedAt).toLocaleDateString("en-US", {
+    day: "numeric", month: "short", year: "numeric", timeZone: "UTC",
+  });
+  const label = `${monument.name} · ${monument.stoneCount.toLocaleString("en-US")} stones · ${date}`;
+  const group = new THREE.Group();
+  group.name = `monument-plaque-${monument.round}`;
+  group.userData.label = label;
+  group.position.set(0, 0.85, monument.radius * 0.75 + 1.1);
+  if (typeof document === "undefined") return group;
+  const canvas = document.createElement("canvas");
+  canvas.width = 768;
+  canvas.height = 208;
+  const context = canvas.getContext("2d");
+  if (!context) return group;
+  context.fillStyle = "rgba(252,249,238,0.96)";
+  context.beginPath();
+  context.roundRect(8, 8, 752, 184, 35);
+  context.fill();
+  context.fillStyle = "#52654c";
+  context.textAlign = "center";
+  context.font = "600 40px system-ui, sans-serif";
+  context.fillText(monument.name, 384, 80, 692);
+  context.fillStyle = "#7a8370";
+  context.font = "400 27px system-ui, sans-serif";
+  context.fillText(`${monument.stoneCount.toLocaleString("en-US")} stones · ${date}`, 384, 131, 692);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(5.8, 1.57, 1);
+  sprite.renderOrder = 3;
+  group.add(sprite);
+  return group;
+}
+
+function disposeObject(root: THREE.Object3D) {
+  const disposed = new Set<Disposable>();
+  root.traverse((object) => {
+    if (!(object instanceof THREE.Mesh) && !(object instanceof THREE.Sprite)) return;
+    if (object instanceof THREE.Mesh) disposed.add(object.geometry);
+    const materials = Array.isArray(object.material) ? object.material : [object.material];
+    for (const material of materials) {
+      disposed.add(material);
+      if ("map" in material && material.map instanceof THREE.Texture) disposed.add(material.map);
+    }
+  });
+  disposed.forEach((item) => item.dispose());
+  return disposed;
+}
 
 /**
- * Adds a deterministic, visually unbounded miniature meadow. The central pit
- * and its subtle worn approach remain authored at world origin; everything
- * outside that landmark is streamed through a fixed-size instance pool.
+ * Everything except the people is geometry generated locally. No panorama,
+ * scenery models, texture downloads, or postprocessing stand between arrival
+ * and the first stone. Repeated scenery uses eight bounded instanced meshes.
  */
-export function createStorybookWorld(scene: THREE.Scene): StorybookWorld {
+export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
+  const previousBackground = scene.background;
+  const previousFog = scene.fog;
+  scene.background = new THREE.Color(WORLD_COLORS.sky);
+  scene.fog = new THREE.Fog(WORLD_COLORS.sky, 38, 115);
   const root = new THREE.Group();
-  root.name = "storybook-world";
+  root.name = "waiting-world";
   scene.add(root);
+  const hemisphere = new THREE.HemisphereLight(0xfff9e9, 0x829376, 1.75);
+  root.add(hemisphere);
+  const sun = new THREE.DirectionalLight(0xffefd3, 2.4);
+  sun.position.set(-24, 38, 18);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  sun.shadow.camera.left = -25;
+  sun.shadow.camera.right = 25;
+  sun.shadow.camera.top = 25;
+  sun.shadow.camera.bottom = -25;
+  sun.shadow.camera.near = 1;
+  sun.shadow.camera.far = 100;
+  sun.shadow.normalBias = 0.04;
+  sun.shadow.bias = -0.0001;
+  sun.shadow.radius = 3;
+  root.add(sun, sun.target);
 
-  const authoredRoot = new THREE.Group();
-  authoredRoot.name = "authored-environment-v2";
-  root.add(authoredRoot);
-  const authoredAssets: Partial<
-    Record<AuthoredEnvironmentKey, InstalledEnvironmentAsset>
-  > = {};
-  const environmentAbort = new AbortController();
-  let worldDisposed = false;
-
-  const disposable = new Set<Disposable>();
-  const remember = <T extends Disposable>(value: T) => {
-    disposable.add(value);
-    return value;
-  };
-  const transform = new THREE.Object3D();
-
-  const setAuthoredInstance = (
-    pool: EnvironmentInstancedPool,
-    index: number,
-    x: number,
-    y: number,
-    z: number,
-    scaleX: number,
-    scaleY: number,
-    scaleZ: number,
-    rotationY = 0,
-  ) => {
-    transform.position.set(x, y, z);
-    transform.scale.set(scaleX, scaleY, scaleZ);
-    transform.rotation.set(0, rotationY, 0);
-    transform.updateMatrix();
-    pool.setMatrixAt(index, transform.matrix);
-  };
-
-  const groundGeometry = remember(
-    new THREE.PlaneGeometry(WORLD_CHUNK_SIZE + 0.12, WORLD_CHUNK_SIZE + 0.12),
-  );
-  groundGeometry.rotateX(-Math.PI / 2);
-  const groundMaterial = remember(
-    new THREE.MeshStandardMaterial({ color: 0x9b915d, roughness: 1, metalness: 0 }),
-  );
-  const groundTiles = new THREE.InstancedMesh(
-    groundGeometry,
-    groundMaterial,
-    WORLD_CHUNK_COUNT,
-  );
-  groundTiles.name = "streamed-meadow-tiles";
-  groundTiles.receiveShadow = true;
-  groundTiles.frustumCulled = false;
-  root.add(groundTiles);
-
-  // The origin tile is a separate square-with-hole so the recessed pit stays
-  // genuinely open instead of being hidden behind a large ground plane.
-  const centralGroundGeometry = remember(createCentralMeadowGeometry());
-  const centralGround = new THREE.Mesh(centralGroundGeometry, groundMaterial);
-  centralGround.name = "central-pit-meadow";
-  centralGround.position.y = -0.024;
-  centralGround.receiveShadow = true;
-  root.add(centralGround);
-
-  remember(
-    attachEnvironmentMaterialTextures(
-      [{ material: groundMaterial, texturedColor: 0xe6e3c1 }],
-      ENVIRONMENT_TEXTURE_PATHS.grass,
-      { repeat: 14, normalScale: 0.24 },
-    ),
-  );
-
-  // The reference trail is broad enough to read at phone scale, but its soft
-  // edges and meadow detail keep it feeling walked-in rather than paved.
-  const pathPoints = [
-    new THREE.Vector3(-2.8, 0, 48),
-    new THREE.Vector3(-1.7, 0, 35),
-    new THREE.Vector3(0.2, 0, 22),
-    new THREE.Vector3(2.5, 0, 12.2),
-    new THREE.Vector3(6.3, 0, 6.3),
-    new THREE.Vector3(7.05, 0, -0.4),
-    new THREE.Vector3(5.7, 0, -7.8),
-    new THREE.Vector3(2.1, 0, -17.2),
-    new THREE.Vector3(0.2, 0, -28),
-  ];
-  const pathWidths = [1.42, 1.3, 1.16, 1.03, 0.96, 1, 1.1, 1.25, 1.42];
-  const pathCurve = new THREE.CatmullRomCurve3(pathPoints, false, "centripetal");
-  const pathSamples = Array.from({ length: 72 }, (_, index) =>
-    pathCurve.getPointAt(index / 71),
-  );
-
-  const pathEdgeGeometry = remember(
-    makePathRibbonGeometry(pathCurve, pathWidths, 1.22, 0.008, false),
-  );
-  const pathEdgeMaterial = remember(
-    new THREE.MeshStandardMaterial({
-      color: 0x6f5b3d,
-      roughness: 1,
-      metalness: 0,
-      transparent: true,
-      opacity: 0.1,
-      depthWrite: false,
-    }),
-  );
-  const pathEdge = new THREE.Mesh(pathEdgeGeometry, pathEdgeMaterial);
-  pathEdge.receiveShadow = true;
-  root.add(pathEdge);
-
-  const pathGeometry = remember(
-    makePathRibbonGeometry(pathCurve, pathWidths, 1, 0.013, true),
-  );
-  const pathMaterial = remember(
-    new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 1,
-      metalness: 0,
-      vertexColors: true,
-      transparent: true,
-      opacity: 0.42,
-      depthWrite: false,
-    }),
-  );
-  const path = new THREE.Mesh(pathGeometry, pathMaterial);
-  path.receiveShadow = true;
-  root.add(path);
-
-  const pathWidthAt = (t: number) => {
-    const widthPosition = THREE.MathUtils.clamp(t, 0, 1) * (pathWidths.length - 1);
-    const widthIndex = Math.min(pathWidths.length - 2, Math.floor(widthPosition));
-    return THREE.MathUtils.lerp(
-      pathWidths[widthIndex],
-      pathWidths[widthIndex + 1],
-      widthPosition - widthIndex,
-    );
-  };
-
-  const populateAuthoredPath = (pool: EnvironmentInstancedPool) => {
-    const point = new THREE.Vector3();
-    const tangent = new THREE.Vector3();
-    for (let index = 0; index < AUTHORED_PATH_MODULES; index += 1) {
-      const t = (index + 0.5) / AUTHORED_PATH_MODULES;
-      pathCurve.getPointAt(t, point);
-      pathCurve.getTangentAt(t, tangent);
-      const widthScale = pathWidthAt(t) / 1.1;
-      setAuthoredInstance(
-        pool,
-        index,
-        point.x,
-        -0.1,
-        point.z,
-        1.08,
-        1,
-        widthScale * 0.52,
-        Math.atan2(-tangent.z, tangent.x),
-      );
-    }
-    pool.commit(AUTHORED_PATH_MODULES);
-  };
-
-  const pointForChunk = (
-    chunkX: number,
-    chunkZ: number,
-    random: () => number,
-    pitClearance: number,
-    pathClearance: number,
-  ): ChunkPoint => {
-    let x = chunkX * WORLD_CHUNK_SIZE;
-    let z = chunkZ * WORLD_CHUNK_SIZE;
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      x = (chunkX + random() - 0.5) * WORLD_CHUNK_SIZE;
-      z = (chunkZ + random() - 0.5) * WORLD_CHUNK_SIZE;
-      if (Math.hypot(x, z) < pitClearance) continue;
-      if (
-        pathClearance > 0 &&
-        Math.abs(x) < 12 &&
-        z > -32 &&
-        z < 52 &&
-        isNearPath(x, z, pathSamples, pathClearance)
-      ) {
-        continue;
-      }
-      return { x, z, visible: true };
-    }
-    return { x, z, visible: false };
-  };
-
-  const patchGeometry = remember(new THREE.CircleGeometry(1, 18));
-  patchGeometry.rotateX(-Math.PI / 2);
-  const patchMaterial = remember(
-    new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.12,
-      depthWrite: false,
-      toneMapped: false,
-    }),
-  );
-  const patches = new THREE.InstancedMesh(
-    patchGeometry,
-    patchMaterial,
-    WORLD_CHUNK_COUNT * PATCHES_PER_CHUNK,
-  );
-  patches.frustumCulled = false;
-  const patchColors = [
-    new THREE.Color(0xa49f6a),
-    new THREE.Color(0xb0a974),
-    new THREE.Color(0xc2b682),
-  ];
-  root.add(patches);
-
-  const grassGeometry = remember(
-    new THREE.BufferGeometry()
-      .setAttribute(
-        "position",
-        new THREE.Float32BufferAttribute(
-          [
-            -0.05, 0, 0, 0.05, 0, 0, 0, 0.34, 0,
-            0, 0, -0.05, 0, 0, 0.05, 0, 0.34, 0,
-            -0.036, 0, -0.036, 0.036, 0, 0.036, 0, 0.3, 0,
-          ],
-          3,
-        ),
-      )
-      .setIndex([0, 1, 2, 3, 4, 5, 6, 7, 8]),
-  );
-  grassGeometry.computeVertexNormals();
-  const grassMaterial = remember(
-    new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 1,
-      side: THREE.DoubleSide,
-      transparent: true,
-      opacity: 0.6,
-      alphaTest: 0.08,
-      depthWrite: false,
-    }),
-  );
-  const grass = new THREE.InstancedMesh(
-    grassGeometry,
-    grassMaterial,
-    WORLD_CHUNK_COUNT * GRASS_MARKS_PER_CHUNK,
-  );
-  grass.frustumCulled = false;
-  const grassColors = [
-    new THREE.Color(0x687941),
-    new THREE.Color(0x7c8c49),
-    new THREE.Color(0x91a052),
-    new THREE.Color(0xa7a264),
-  ];
-  root.add(grass);
-
-  const flowerGeometry = remember(new THREE.CircleGeometry(0.065, 8));
-  flowerGeometry.rotateX(-Math.PI / 2);
-  const flowerMaterial = remember(
-    new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.82,
-      depthWrite: false,
-      toneMapped: false,
-    }),
-  );
-  const flowers = new THREE.InstancedMesh(
-    flowerGeometry,
-    flowerMaterial,
-    WORLD_CHUNK_COUNT * FLOWERS_PER_CHUNK,
-  );
-  flowers.frustumCulled = false;
-  const flowerColors = [
-    new THREE.Color(0xffedc2),
-    new THREE.Color(0xf2d979),
-    new THREE.Color(0xf7f0d1),
-  ];
-  root.add(flowers);
-
-  const trunkGeometry = remember(new THREE.CylinderGeometry(0.14, 0.23, 1.4, 6));
-  const trunkMaterial = remember(
-    new THREE.MeshStandardMaterial({ color: 0x665239, roughness: 1 }),
-  );
-  const trunks = new THREE.InstancedMesh(
-    trunkGeometry,
-    trunkMaterial,
-    WORLD_CHUNK_COUNT * TREES_PER_CHUNK,
-  );
-  trunks.frustumCulled = false;
-  root.add(trunks);
-
-  const foliageGeometry = remember(new THREE.DodecahedronGeometry(1, 0));
-  const foliageMaterial = remember(
-    new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 1,
-      emissive: 0x4d5336,
-      emissiveIntensity: 0.14,
-    }),
-  );
-  const foliage = new THREE.InstancedMesh(
-    foliageGeometry,
-    foliageMaterial,
-    WORLD_CHUNK_COUNT * (TREES_PER_CHUNK * 2 + BUSHES_PER_CHUNK),
-  );
-  foliage.frustumCulled = false;
-  const foliageColors = [
-    new THREE.Color(0x71805a),
-    new THREE.Color(0x839063),
-    new THREE.Color(0x94976b),
-    new THREE.Color(0xa49e73),
-  ];
-  root.add(foliage);
-
-  const decorativeRockGeometry = remember(new THREE.DodecahedronGeometry(0.46, 0));
-  const decorativeRockMaterial = remember(
-    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 }),
-  );
-  const decorativeRocks = new THREE.InstancedMesh(
-    decorativeRockGeometry,
-    decorativeRockMaterial,
-    WORLD_CHUNK_COUNT * ROCKS_PER_CHUNK,
-  );
-  decorativeRocks.frustumCulled = false;
-  decorativeRocks.receiveShadow = true;
-  const decorativeRockColors = [
-    new THREE.Color(0x837a60),
-    new THREE.Color(0x999071),
-    new THREE.Color(0x746f58),
-  ];
-  root.add(decorativeRocks);
-
-  const refreshInstances = (mesh: THREE.InstancedMesh, colors = false) => {
-    mesh.instanceMatrix.needsUpdate = true;
-    if (colors && mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  };
-
-  let centerChunkX = Number.NaN;
-  let centerChunkZ = Number.NaN;
-
-  const refreshChunks = (nextChunkX: number, nextChunkZ: number) => {
-    let groundIndex = 0;
-    let patchIndex = 0;
-    let grassIndex = 0;
-    let flowerIndex = 0;
-    let trunkIndex = 0;
-    let foliageIndex = 0;
-    let rockIndex = 0;
-    let authoredGrassIndex = 0;
-    let authoredFlowerIndex = 0;
-    let authoredTreeIndex = 0;
-    let authoredShrubIndex = 0;
-    let authoredRockIndex = 0;
-
-    for (
-      let chunkZ = nextChunkZ - WORLD_CHUNK_RADIUS;
-      chunkZ <= nextChunkZ + WORLD_CHUNK_RADIUS;
-      chunkZ += 1
-    ) {
-      for (
-        let chunkX = nextChunkX - WORLD_CHUNK_RADIUS;
-        chunkX <= nextChunkX + WORLD_CHUNK_RADIUS;
-        chunkX += 1
-      ) {
-        const chunkLodDistance = Math.max(
-          Math.abs(chunkX - nextChunkX),
-          Math.abs(chunkZ - nextChunkZ),
-        );
-        const authoredNear = (asset: AuthoredEnvironmentKey) =>
-          Boolean(authoredAssets[asset]) &&
-          chunkLodDistance <=
-            WAITLAND_ENVIRONMENT_MANIFEST.assets[asset].placement.authoredChunkRadius;
-
-        if (chunkX !== 0 || chunkZ !== 0) {
-          setInstance(
-            groundTiles,
-            groundIndex,
-            transform,
-            chunkX * WORLD_CHUNK_SIZE,
-            -0.025,
-            chunkZ * WORLD_CHUNK_SIZE,
-            1,
-            1,
-            1,
-          );
-          groundIndex += 1;
-        }
-
-        const patchRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x2a51));
-        for (let slot = 0; slot < PATCHES_PER_CHUNK; slot += 1) {
-          const point = pointForChunk(
-            chunkX,
-            chunkZ,
-            patchRandom,
-            PIT_MEADOW_CLEARANCE + 0.2,
-            0.48,
-          );
-          const size = point.visible ? 1.35 + patchRandom() * 3.7 : 0;
-          setInstance(
-            patches,
-            patchIndex,
-            transform,
-            point.x,
-            0.008,
-            point.z,
-            size,
-            1,
-            size * (0.4 + patchRandom() * 0.48),
-            patchRandom() * Math.PI,
-          );
-          patches.setColorAt(
-            patchIndex,
-            patchColors[Math.floor(patchRandom() * patchColors.length)],
-          );
-          patchIndex += 1;
-        }
-
-        const grassRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x6ba7));
-        const useAuthoredGrass = authoredNear("grass");
-        // Cheap crossed blades remain beneath the authored clusters. They are
-        // what makes the near field continuous instead of a few isolated props.
-        for (let slot = 0; slot < GRASS_MARKS_PER_CHUNK; slot += 1) {
-          const point = pointForChunk(
-            chunkX,
-            chunkZ,
-            grassRandom,
-            PIT_LIP_OUTER_RADIUS - 0.18,
-            0.08,
-          );
-          const visibleScale = point.visible ? 1 : 0;
-          const length = (0.55 + grassRandom() * 1.05) * visibleScale;
-          setInstance(
-            grass,
-            grassIndex,
-            transform,
-            point.x,
-            0.017,
-            point.z,
-            (0.72 + grassRandom() * 0.55) * visibleScale,
-            length,
-            (0.72 + grassRandom() * 0.55) * visibleScale,
-            grassRandom() * Math.PI,
-          );
-          grass.setColorAt(
-            grassIndex,
-            grassColors[Math.floor(grassRandom() * grassColors.length)],
-          );
-          grassIndex += 1;
-        }
-
-        const authoredGrass = authoredAssets.grass?.pool;
-        if (authoredGrass && useAuthoredGrass) {
-          const clusterRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x6bb9));
-          for (
-            let slot = 0;
-            slot < WAITLAND_ENVIRONMENT_MANIFEST.assets.grass.placement.instancesPerChunk;
-            slot += 1
-          ) {
-            const point = pointForChunk(
-              chunkX,
-              chunkZ,
-              clusterRandom,
-              PIT_LIP_OUTER_RADIUS - 0.12,
-              0.12,
-            );
-            if (!point.visible) continue;
-            const size = 0.78 + clusterRandom() * 0.5;
-            setAuthoredInstance(
-              authoredGrass,
-              authoredGrassIndex,
-              point.x,
-              0.012,
-              point.z,
-              size * (0.88 + clusterRandom() * 0.22),
-              size * (0.82 + clusterRandom() * 0.32),
-              size * (0.88 + clusterRandom() * 0.22),
-              clusterRandom() * Math.PI * 2,
-            );
-            authoredGrassIndex += 1;
-          }
-        }
-
-        const flowerRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x8de1));
-        const useAuthoredFlowers = authoredNear("flowers");
-        // Tiny procedural blooms fill the gaps between Meshy flower accents.
-        for (let slot = 0; slot < FLOWERS_PER_CHUNK; slot += 1) {
-          const point = pointForChunk(
-            chunkX,
-            chunkZ,
-            flowerRandom,
-            PIT_LIP_OUTER_RADIUS + 0.34,
-            0.72,
-          );
-          const size = point.visible ? 0.66 + flowerRandom() * 0.82 : 0;
-          setInstance(
-            flowers,
-            flowerIndex,
-            transform,
-            point.x,
-            0.025,
-            point.z,
-            size,
-            size * 0.72,
-            size,
-          );
-          flowers.setColorAt(
-            flowerIndex,
-            flowerColors[Math.floor(flowerRandom() * flowerColors.length)],
-          );
-          flowerIndex += 1;
-        }
-
-        const authoredFlowers = authoredAssets.flowers?.pool;
-        if (authoredFlowers && useAuthoredFlowers) {
-          const clusterRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0x8df7));
-          for (
-            let slot = 0;
-            slot < WAITLAND_ENVIRONMENT_MANIFEST.assets.flowers.placement.instancesPerChunk;
-            slot += 1
-          ) {
-            const point = pointForChunk(
-              chunkX,
-              chunkZ,
-              clusterRandom,
-              PIT_LIP_OUTER_RADIUS + 0.42,
-              0.78,
-            );
-            if (!point.visible) continue;
-            const size = 0.72 + clusterRandom() * 0.38;
-            setAuthoredInstance(
-              authoredFlowers,
-              authoredFlowerIndex,
-              point.x,
-              0.016,
-              point.z,
-              size,
-              size * (0.88 + clusterRandom() * 0.22),
-              size,
-              clusterRandom() * Math.PI * 2,
-            );
-            authoredFlowerIndex += 1;
-          }
-        }
-
-        const treeRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0xa4c3));
-        const useAuthoredTrees = authoredNear("tree");
-        for (let slot = 0; slot < TREES_PER_CHUNK; slot += 1) {
-          const tree = pointForChunk(chunkX, chunkZ, treeRandom, 18, 2.4);
-          const treeVisible = tree.visible && treeRandom() > 0.44;
-          const size = treeVisible ? 0.78 + treeRandom() * 0.64 : 0;
-          const rotation = treeRandom() * Math.PI;
-          if (!useAuthoredTrees) {
-            setInstance(
-              trunks,
-              trunkIndex,
-              transform,
-              tree.x,
-              size * 0.7,
-              tree.z,
-              size * 0.9,
-              size,
-              size * 0.9,
-              rotation,
-            );
-            trunkIndex += 1;
-
-            setInstance(
-              foliage,
-              foliageIndex,
-              transform,
-              tree.x - size * 0.16,
-              size * 1.48,
-              tree.z,
-              size * 0.82,
-              size * 0.72,
-              size * 0.78,
-              rotation,
-            );
-            foliage.setColorAt(
-              foliageIndex,
-              foliageColors[Math.floor(treeRandom() * foliageColors.length)],
-            );
-            foliageIndex += 1;
-            setInstance(
-              foliage,
-              foliageIndex,
-              transform,
-              tree.x + size * 0.18,
-              size * 2.02,
-              tree.z - size * 0.06,
-              size * 0.62,
-              size * 0.66,
-              size * 0.6,
-              rotation + 0.7,
-            );
-            foliage.setColorAt(
-              foliageIndex,
-              foliageColors[Math.floor(treeRandom() * foliageColors.length)],
-            );
-            foliageIndex += 1;
-          }
-
-          const authoredTrees = authoredAssets.tree?.pool;
-          if (authoredTrees && useAuthoredTrees && treeVisible) {
-            setAuthoredInstance(
-              authoredTrees,
-              authoredTreeIndex,
-              tree.x,
-              0.008,
-              tree.z,
-              size * (0.88 + treeRandom() * 0.16),
-              size,
-              size * (0.88 + treeRandom() * 0.16),
-              rotation,
-            );
-            authoredTreeIndex += 1;
-          }
-        }
-
-        const bushRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0xc271));
-        const useAuthoredShrubs = authoredNear("shrubs");
-        for (let slot = 0; slot < BUSHES_PER_CHUNK; slot += 1) {
-          const bush = pointForChunk(chunkX, chunkZ, bushRandom, 13, 1.6);
-          const bushVisible = bush.visible && bushRandom() > 0.3;
-          const size = bushVisible ? 0.42 + bushRandom() * 0.58 : 0;
-          const stretchX = 1.15 + bushRandom() * 0.35;
-          const stretchY = 0.7 + bushRandom() * 0.28;
-          const rotation = bushRandom() * Math.PI;
-          if (!useAuthoredShrubs) {
-            setInstance(
-              foliage,
-              foliageIndex,
-              transform,
-              bush.x,
-              size * 0.58,
-              bush.z,
-              size * stretchX,
-              size * stretchY,
-              size,
-              rotation,
-            );
-            foliage.setColorAt(
-              foliageIndex,
-              foliageColors[Math.floor(bushRandom() * foliageColors.length)],
-            );
-            foliageIndex += 1;
-          }
-
-          const authoredShrubs = authoredAssets.shrubs?.pool;
-          if (authoredShrubs && useAuthoredShrubs && bushVisible) {
-            setAuthoredInstance(
-              authoredShrubs,
-              authoredShrubIndex,
-              bush.x,
-              0.01,
-              bush.z,
-              size * (0.94 + bushRandom() * 0.22),
-              size * (0.82 + bushRandom() * 0.28),
-              size * (0.94 + bushRandom() * 0.22),
-              rotation,
-            );
-            authoredShrubIndex += 1;
-          }
-        }
-
-        const rockRandom = seededRandom(seedForChunk(chunkX, chunkZ, 0xe913));
-        const useAuthoredRocks = authoredNear("rocks");
-        for (let slot = 0; slot < ROCKS_PER_CHUNK; slot += 1) {
-          const rock = pointForChunk(chunkX, chunkZ, rockRandom, 13.5, 1.7);
-          const rockVisible = rock.visible && rockRandom() > 0.26;
-          const size = rockVisible ? 0.42 + rockRandom() * 0.94 : 0;
-          const stretchX = 0.75 + rockRandom() * 0.45;
-          const rotationX = rockRandom() * 1.2;
-          const rotationY = rockRandom() * Math.PI;
-          const rotationZ = rockRandom() * 1.2;
-          if (!useAuthoredRocks) {
-            transform.position.set(rock.x, size * 0.19, rock.z);
-            transform.scale.set(size * stretchX, size * 0.62, size);
-            transform.rotation.set(rotationX, rotationY, rotationZ);
-            transform.updateMatrix();
-            decorativeRocks.setMatrixAt(rockIndex, transform.matrix);
-            decorativeRocks.setColorAt(
-              rockIndex,
-              decorativeRockColors[
-                Math.floor(rockRandom() * decorativeRockColors.length)
-              ],
-            );
-            rockIndex += 1;
-          }
-
-          const authoredRocks = authoredAssets.rocks?.pool;
-          if (authoredRocks && useAuthoredRocks && rockVisible) {
-            setAuthoredInstance(
-              authoredRocks,
-              authoredRockIndex,
-              rock.x,
-              0.01,
-              rock.z,
-              size * stretchX,
-              size * (0.78 + rockRandom() * 0.2),
-              size * (0.9 + rockRandom() * 0.2),
-              rotationY,
-            );
-            authoredRockIndex += 1;
-          }
-        }
-      }
-    }
-
-    groundTiles.count = groundIndex;
-    patches.count = patchIndex;
-    grass.count = grassIndex;
-    flowers.count = flowerIndex;
-    trunks.count = trunkIndex;
-    foliage.count = foliageIndex;
-    decorativeRocks.count = rockIndex;
-    refreshInstances(groundTiles);
-    refreshInstances(patches, true);
-    refreshInstances(grass, true);
-    refreshInstances(flowers, true);
-    refreshInstances(trunks);
-    refreshInstances(foliage, true);
-    refreshInstances(decorativeRocks, true);
-    authoredAssets.grass?.pool.commit(authoredGrassIndex);
-    authoredAssets.flowers?.pool.commit(authoredFlowerIndex);
-    authoredAssets.tree?.pool.commit(authoredTreeIndex);
-    authoredAssets.shrubs?.pool.commit(authoredShrubIndex);
-    authoredAssets.rocks?.pool.commit(authoredRockIndex);
-  };
-
-  // Retain a travelling horizon anchor for the streaming contract, but leave
-  // it free of spherical hills/clouds. The portrait raster plate now supplies
-  // that depth without opaque domes obscuring its painted skyline.
-  const horizonRoot = new THREE.Group();
-  horizonRoot.name = "travelling-horizon";
-  root.add(horizonRoot);
-
-  refreshChunks(0, 0);
-  centerChunkX = 0;
-  centerChunkZ = 0;
-
-  const installAuthoredAsset = async (key: AuthoredEnvironmentKey) => {
-    const manifest = WAITLAND_ENVIRONMENT_MANIFEST.assets[key];
-    const result = await loadEnvironmentAsset(manifest, {
-      signal: environmentAbort.signal,
-    });
-    if (!result.ok) return;
-    if (worldDisposed) {
-      result.asset.dispose();
-      return;
-    }
-
-    const capacity =
-      key === "path"
-        ? AUTHORED_PATH_MODULES
-        : WORLD_CHUNK_COUNT * manifest.placement.instancesPerChunk;
-    const pool = result.asset.createInstancedPool(
-      capacity,
-      `authored-${manifest.assetId}`,
-    );
-    authoredAssets[key] = { lease: result.asset, pool };
-    authoredRoot.add(pool.root);
-
-    if (key === "path") {
-      populateAuthoredPath(pool);
-      for (const mesh of pool.meshes) {
-        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-        for (const material of materials) {
-          material.transparent = true;
-          material.opacity = 0.28;
-          material.depthWrite = false;
-          material.needsUpdate = true;
-        }
-      }
-      // Keep the broad ribbon as the readable trail silhouette. The authored
-      // modules add tactile soil and pebble detail without turning it into a
-      // pair of narrow raised seams.
-      return;
-    }
-    refreshChunks(centerChunkX, centerChunkZ);
-  };
-
-  if (typeof document !== "undefined") {
-    for (const key of Object.keys(
-      WAITLAND_ENVIRONMENT_MANIFEST.assets,
-    ) as AuthoredEnvironmentKey[]) {
-      void installAuthoredAsset(key);
-    }
+  const roughMaterial = (color: THREE.ColorRepresentation) => new THREE.MeshStandardMaterial({ color, roughness: 1, metalness: 0 });
+  const grassMaterial = roughMaterial(WORLD_COLORS.grass);
+  let currentPit = createInitialPitState();
+  let groundOriginX = 0;
+  let groundOriginZ = 0;
+  const ground = new THREE.Mesh(meadowGeometry(currentPit), grassMaterial);
+  ground.name = "waitland-ground";
+  ground.receiveShadow = true;
+  root.add(ground);
+  const pit = new THREE.Group();
+  pit.name = "active-pit";
+  root.add(pit);
+  // An art-directed floor stays dark even under bright mobile tone mapping.
+  // Its radial vertex shading reads as depth before the first rock arrives.
+  const floorGeometry = createPitFloorGeometry();
+  const floorColors = new Float32Array(floorGeometry.getAttribute("position").count * 3);
+  const floorCenter = new THREE.Color(0x34432e);
+  const floorEdge = new THREE.Color(WORLD_COLORS.pit);
+  for (let index = 0; index < floorColors.length / 3; index += 1) {
+    const color = index === 0 ? floorCenter : floorEdge;
+    floorColors.set([color.r, color.g, color.b], index * 3);
   }
+  floorGeometry.setAttribute("color", new THREE.BufferAttribute(floorColors, 3));
+  const floorMaterial = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false });
+  const wallMaterial = roughMaterial(0x776f53);
+  wallMaterial.side = THREE.DoubleSide;
+  const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+  const wall = new THREE.Mesh(createPitWallGeometry(), wallMaterial);
+  const lip = new THREE.Mesh(createPitLipGeometry(), roughMaterial(WORLD_COLORS.earth));
+  const turf = new THREE.Mesh(createPitTurfGeometry(), grassMaterial);
+  floor.name = "pit-floor";
+  wall.name = "pit-wall";
+  lip.name = "pit-lip";
+  for (const mesh of [floor, wall, lip, turf]) {
+    mesh.receiveShadow = true;
+    pit.add(mesh);
+  }
+  const pitTarget = new THREE.Mesh(
+    new THREE.CircleGeometry(PIT_RADIUS + 0.75, 64).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, colorWrite: false }),
+  );
+  pitTarget.name = "pit-click-target";
+  pitTarget.position.y = 0.06;
+  pitTarget.userData.pit = true;
+  pit.add(pitTarget);
 
+  const rockGeometry = new THREE.IcosahedronGeometry(0.46, 1);
+  const rockPositions = rockGeometry.getAttribute("position");
+  for (let index = 0; index < rockPositions.count; index += 1) {
+    const x = rockPositions.getX(index);
+    const y = rockPositions.getY(index);
+    const z = rockPositions.getZ(index);
+    // Continuous displacement preserves shared vertices and smooth normals.
+    const swell = 1 + Math.sin(x * 13 + y * 5) * 0.055 + Math.cos(z * 11 - y * 4) * 0.06;
+    rockPositions.setXYZ(index, x * swell, y * swell, z * swell);
+  }
+  rockGeometry.computeVertexNormals();
+  rockGeometry.computeBoundingSphere();
+  const stoneMaterials = WORLD_COLORS.stone.map(roughMaterial);
+  const stoneRoot = new THREE.Group();
+  stoneRoot.name = "pickable-stones";
+  root.add(stoneRoot);
+  const stones = new Map<string, StoneMesh>();
+  const fill = new THREE.InstancedMesh(rockGeometry, stoneMaterials[0], 180);
+  fill.name = "pit-contents";
+  fill.count = 0;
+  fill.receiveShadow = true;
+  pit.add(fill);
+  const rimPebbles = new THREE.InstancedMesh(rockGeometry, stoneMaterials[2], 26);
+  rimPebbles.name = "pit-edge-pebbles";
+  const transform = new THREE.Object3D();
+  const setMatrix = (mesh: THREE.InstancedMesh, index: number, x: number, y: number, z: number, sx: number, sy: number, sz: number, rotation = 0) => {
+    transform.position.set(x, y, z);
+    transform.scale.set(sx, sy, sz);
+    transform.rotation.set(0, rotation, 0);
+    transform.updateMatrix();
+    mesh.setMatrixAt(index, transform.matrix);
+  };
+  for (let index = 0; index < rimPebbles.count; index += 1) {
+    const angle = index / rimPebbles.count * Math.PI * 2;
+    const radius = PIT_RADIUS + 0.25 + Math.sin(index * 4.1) * 0.12;
+    const size = 0.17 + (index % 4) * 0.05;
+    setMatrix(rimPebbles, index, Math.cos(angle) * radius, -0.03, Math.sin(angle) * radius, size * 1.4, size * 0.55, size, angle);
+  }
+  rimPebbles.instanceMatrix.needsUpdate = true;
+  pit.add(rimPebbles);
+
+  const markerMaterial = new THREE.MeshBasicMaterial({ color: 0xfff9e8, transparent: true, opacity: 0.82, depthWrite: false });
+  const marker = new THREE.Mesh(new THREE.RingGeometry(0.66, 0.76, 48).rotateX(-Math.PI / 2), markerMaterial);
+  marker.name = "stone-selection-ring";
+  marker.visible = false;
+  marker.renderOrder = 1;
+  root.add(marker);
+  let highlightedId: string | null = null;
+  const monumentRoot = new THREE.Group();
+  monumentRoot.name = "completed-monuments";
+  root.add(monumentRoot);
+  const monuments = new Map<number, THREE.Group>();
+  const monumentBirths = new Map<number, number>();
+  let elapsed = 0;
+  let disposed = false;
+
+  const addMonument = (monument: PitMonument) => {
+    const group = new THREE.Group();
+    group.name = `monument-${monument.round}`;
+    group.userData.monument = { ...monument, center: { ...monument.center } };
+    group.position.set(monument.center.x, 0, monument.center.z);
+    const monumentStone = roughMaterial(0xdfd4be);
+    const monumentAccent = roughMaterial(0xb0b9a0);
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(monument.radius * 0.8, monument.radius * 0.9, 0.5, 40), roughMaterial(0xc6bfa9));
+    base.position.y = 0.22;
+    base.receiveShadow = true;
+    group.add(base);
+    const sculpture = new THREE.Group();
+    sculpture.name = "stone-sculpture";
+    sculpture.position.y = 0.45;
+    group.add(sculpture);
+    const piece = (x: number, y: number, z: number, sx: number, sy: number, sz: number, tilt = 0, accent = false) => {
+      // Geometry is owned by each monument, allowing old landmarks to release
+      // their resources without disposing the live pickable stone geometry.
+      const mesh = new THREE.Mesh(rockGeometry.clone(), accent ? monumentAccent : monumentStone);
+      mesh.position.set(x, y, z);
+      mesh.scale.set(sx, sy, sz);
+      mesh.rotation.set(0.09, monument.round * 0.7, tilt);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      sculpture.add(mesh);
+    };
+    const style = (monument.round - 1) % 4;
+    if (style === 0) {
+      // A patient little stone person, sitting with its hands in its lap.
+      piece(-0.62, 0.45, 0.25, 2.1, 0.85, 1.45, -0.12);
+      piece(0.62, 0.45, 0.25, 2.1, 0.85, 1.45, 0.12);
+      piece(0, 1.35, 0, 2.05, 2.5, 1.35);
+      piece(0, 2.95, 0, 1.8, 1.8, 1.6, -0.08);
+      piece(-0.87, 1.4, 0.37, 0.65, 1.65, 0.8, -0.48);
+      piece(0.87, 1.4, 0.37, 0.65, 1.65, 0.8, 0.48);
+      piece(0, 0.99, 0.83, 1.3, 0.55, 0.65, 0, true);
+    } else if (style === 1) {
+      // An impossible, pleasing balance of smooth river stones.
+      piece(0, 0.45, 0, 3.8, 0.9, 2.5);
+      piece(-0.13, 1.35, 0, 2.4, 1.25, 1.85, -0.15);
+      piece(0.2, 2.27, 0, 3.1, 0.95, 1.6, 0.14);
+      piece(-0.2, 3.16, 0, 1.7, 1.2, 1.4, -0.19);
+      piece(0.03, 4.04, 0, 1.06, 0.94, 1.03, 0, true);
+    } else if (style === 2) {
+      // A doorway made together, with daylight visible through the middle.
+      for (let index = 0; index < 3; index += 1) {
+        piece(-1.35, 0.55 + index * 0.85, 0, 1.7, 1.4, 1.6, 0.08 * (index % 2));
+        piece(1.35, 0.55 + index * 0.85, 0, 1.7, 1.4, 1.6, -0.08 * (index % 2));
+      }
+      piece(-0.79, 3.04, 0, 2.5, 1.17, 1.6, -0.34);
+      piece(0.79, 3.04, 0, 2.5, 1.17, 1.6, 0.34);
+      piece(0, 3.65, 0, 1.4, 1.13, 1.4, 0, true);
+    } else {
+      // A friendly stone bird surveying the next patch of waiting.
+      piece(0, 0.4, 0, 3.4, 0.9, 2.25);
+      piece(0, 1.75, 0, 2.7, 2.85, 1.9);
+      piece(0.45, 3.1, 0, 1.9, 1.55, 1.8);
+      piece(1.27, 3.03, 0.14, 1.25, 0.4, 0.64, -0.1, true);
+      piece(-0.38, 1.94, 0.79, 1.5, 1.9, 0.45, -0.6, true);
+      piece(-1.08, 1.14, -0.14, 1.9, 0.9, 0.8, -0.45);
+    }
+    group.add(monumentPlaque(monument));
+    monuments.set(monument.round, group);
+    monumentRoot.add(group);
+    return group;
+  };
+
+  // Fixed instance capacities prevent long walks from growing the scene.
+  const scenery = new THREE.Group();
+  scenery.name = "meadow-scenery";
+  root.add(scenery);
+  const leafGeometry = new THREE.IcosahedronGeometry(1, 2);
+  const trunkGeometry = new THREE.CylinderGeometry(0.11, 0.2, 1, 7);
+  const foliage = new THREE.InstancedMesh(leafGeometry, roughMaterial(WORLD_COLORS.leaf), 84);
+  const trunks = new THREE.InstancedMesh(trunkGeometry, roughMaterial(WORLD_COLORS.bark), 28);
+  const bushes = new THREE.InstancedMesh(leafGeometry, roughMaterial(WORLD_COLORS.leafLight), 72);
+  const grassGeometry = new THREE.BufferGeometry();
+  grassGeometry.setAttribute("position", new THREE.Float32BufferAttribute([
+    -0.12, 0, 0, 0.04, 0.48, 0, 0.1, 0, 0,
+    0, 0, -0.12, 0, 0.38, -0.07, 0, 0, 0.13,
+  ], 3));
+  grassGeometry.computeVertexNormals();
+  const tuftMaterial = roughMaterial(WORLD_COLORS.grassDark);
+  tuftMaterial.side = THREE.DoubleSide;
+  const grass = new THREE.InstancedMesh(grassGeometry, tuftMaterial, 440);
+  const flowerGeometry = new THREE.IcosahedronGeometry(0.1, 0);
+  const flowers = new THREE.InstancedMesh(flowerGeometry, roughMaterial(0xf3e6bf), 160);
+  const shadowMap = shadowTexture();
+  const contactMaterial = new THREE.MeshBasicMaterial({ map: shadowMap, color: shadowMap ? 0xffffff : 0x778267, transparent: true, opacity: shadowMap ? 1 : 0.12, depthWrite: false });
+  const contactGeometry = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
+  const sceneryShadows = new THREE.InstancedMesh(contactGeometry, contactMaterial, 100);
+  const stoneShadows = new THREE.InstancedMesh(contactGeometry, contactMaterial, 96);
+  stoneShadows.count = 0;
+  stoneShadows.name = "stone-contact-shadows";
+  root.add(stoneShadows);
+  foliage.name = "meadow-tree-canopies";
+  trunks.name = "meadow-tree-trunks";
+  bushes.name = "meadow-bushes";
+  grass.name = "meadow-grass-tufts";
+  flowers.name = "meadow-flowers";
+  sceneryShadows.name = "meadow-contact-shadows";
+  scenery.add(foliage, trunks, bushes, grass, flowers, sceneryShadows);
+  let sceneryTile = "";
+  const isClear = (x: number, z: number, clearance: number) => {
+    if (Math.hypot(x - currentPit.center.x, z - currentPit.center.z) < currentPit.radius + clearance) return false;
+    for (const monument of currentPit.monuments) {
+      if (Math.hypot(x - monument.center.x, z - monument.center.z) < monument.radius + clearance) return false;
+    }
+    return true;
+  };
+  const populateScenery = (playerX: number, playerZ: number) => {
+    const tileX = Math.floor(playerX / 24);
+    const tileZ = Math.floor(playerZ / 24);
+    const key = `${tileX}:${tileZ}:${currentPit.round}`;
+    if (key === sceneryTile) return;
+    sceneryTile = key;
+    const seed = Math.imul(tileX + 673, 0x45d9f3b) ^ Math.imul(tileZ - 137, 0x119de1f3);
+    const random = randomSequence(seed);
+    const originX = tileX * 24 + 12;
+    const originZ = tileZ * 24 + 12;
+    let treeCount = 0;
+    let bushCount = 0;
+    let shadowCount = 0;
+    for (let index = 0; index < trunks.instanceMatrix.count; index += 1) {
+      const angle = random() * Math.PI * 2;
+      const radius = 29 + random() * 60;
+      const x = originX + Math.cos(angle) * radius;
+      const z = originZ + Math.sin(angle) * radius;
+      if (!isClear(x, z, 20)) continue;
+      const size = 1.45 + random() * 1.45;
+      setMatrix(trunks, treeCount, x, size * 1.1, z, size, size * 2.2, size);
+      setMatrix(foliage, treeCount * 3, x, size * 2.7, z, size * 1.35, size * 1.4, size * 1.2, random() * 2);
+      setMatrix(foliage, treeCount * 3 + 1, x - size * 0.68, size * 2.18, z + size * 0.18, size, size * 1.12, size, random() * 2);
+      setMatrix(foliage, treeCount * 3 + 2, x + size * 0.77, size * 2.37, z - size * 0.07, size * 0.88, size * 1.04, size * 0.94, random() * 2);
+      for (let leaf = 0; leaf < 3; leaf += 1) foliage.setColorAt(treeCount * 3 + leaf, new THREE.Color().setHSL(0.29 + random() * 0.03, 0.17, 0.68 + random() * 0.13));
+      setMatrix(sceneryShadows, shadowCount++, x + 0.8, -0.013, z - 0.5, size * 4.8, 1, size * 3.6);
+      treeCount += 1;
+    }
+    for (let index = 0; index < bushes.instanceMatrix.count; index += 1) {
+      const x = originX + (random() - 0.5) * 140;
+      const z = originZ + (random() - 0.5) * 140;
+      if (!isClear(x, z, 19)) continue;
+      const size = 0.45 + random() * 0.85;
+      setMatrix(bushes, bushCount++, x, size * 0.46, z, size * 1.35, size * 0.72, size, random() * 3);
+      setMatrix(sceneryShadows, shadowCount++, x, -0.012, z, size * 3.4, 1, size * 2.8);
+    }
+    let grassCount = 0;
+    let flowerCount = 0;
+    for (let index = 0; index < grass.instanceMatrix.count; index += 1) {
+      const x = originX + (random() - 0.5) * 122;
+      const z = originZ + (random() - 0.5) * 122;
+      if (!isClear(x, z, 1.2)) continue;
+      const size = 0.6 + random() * 0.75;
+      setMatrix(grass, grassCount++, x, 0, z, size, size, size, random() * Math.PI);
+      if (random() > 0.63 && flowerCount < flowers.instanceMatrix.count) {
+        setMatrix(flowers, flowerCount++, x + 0.06, size * 0.36, z, size, size * 0.6, size);
+      }
+    }
+    foliage.count = treeCount * 3;
+    trunks.count = treeCount;
+    bushes.count = bushCount;
+    grass.count = grassCount;
+    flowers.count = flowerCount;
+    sceneryShadows.count = shadowCount;
+    for (const mesh of [foliage, trunks, bushes, grass, flowers, sceneryShadows]) {
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    }
+  };
+
+  const particleGeometry = new THREE.IcosahedronGeometry(0.09, 0);
+  const particleMaterial = new THREE.MeshBasicMaterial({ color: 0xfff4d1 });
+  const particles = new THREE.InstancedMesh(particleGeometry, particleMaterial, 96);
+  particles.name = "celebration-particles";
+  particles.count = 0;
+  particles.frustumCulled = false;
+  root.add(particles);
+  const particleStates: { x: number; z: number; vx: number; vz: number; vy: number; born: number; life: number }[] = [];
+  const burst = (x: number, z: number, kind: "deposit" | "monument" = "deposit") => {
+    const count = kind === "monument" ? 52 : 12;
+    const random = randomSequence(Math.floor(elapsed * 1000) + Math.floor(x * 971 + z * 283));
+    for (let index = 0; index < count; index += 1) {
+      const angle = random() * Math.PI * 2;
+      const speed = (kind === "monument" ? 2.8 : 1) * (0.6 + random());
+      particleStates.push({ x, z, vx: Math.cos(angle) * speed, vz: Math.sin(angle) * speed, vy: (kind === "monument" ? 5.8 : 3.2) + random() * 2, born: elapsed, life: kind === "monument" ? 2.2 : 1.1 });
+    }
+    if (particleStates.length > 96) particleStates.splice(0, particleStates.length - 96);
+  };
+
+  const setPit = (next: PitState) => {
+    const changedLayout = currentPit.round !== next.round || currentPit.radius !== next.radius || currentPit.center.x !== next.center.x || currentPit.center.z !== next.center.z;
+    const previousRound = currentPit.round;
+    currentPit = { ...next, center: { ...next.center }, monuments: next.monuments.map((monument) => ({ ...monument, center: { ...monument.center } })) };
+    pit.position.set(next.center.x, 0, next.center.z);
+    pit.scale.set(next.radius / PIT_RADIUS, 1.9, next.radius / PIT_RADIUS);
+    pit.userData.round = next.round;
+    pit.userData.count = next.count;
+    pit.userData.capacity = next.capacity;
+    if (changedLayout) {
+      ground.geometry.dispose();
+      ground.geometry = meadowGeometry(next, groundOriginX, groundOriginZ);
+      sceneryTile = "";
+    }
+    const fraction = Math.max(0, Math.min(1, next.count / Math.max(1, next.capacity)));
+    const count = next.count === 0 ? 0 : Math.max(1, Math.round(fraction * 180));
+    const random = randomSequence(0x57414954 + next.round);
+    for (let index = 0; index < count; index += 1) {
+      const angle = index * 2.399963229728653;
+      const ring = Math.sqrt((index + 0.5) / 180) * (PIT_RADIUS - 0.57);
+      const size = 0.55 + random() * 0.3;
+      const y = -0.75 + Math.max(0, fraction - 0.55) * 0.9 + random() * 0.04;
+      setMatrix(fill, index, Math.cos(angle) * ring, y, Math.sin(angle) * ring, size, size * 0.62, size, angle);
+      fill.setColorAt(index, new THREE.Color(WORLD_COLORS.stone[index % WORLD_COLORS.stone.length]));
+    }
+    fill.count = count;
+    fill.instanceMatrix.needsUpdate = true;
+    if (fill.instanceColor) fill.instanceColor.needsUpdate = true;
+    fill.computeBoundingSphere();
+    const visibleRounds = new Set(next.monuments.map((monument) => monument.round));
+    for (const [round, monument] of monuments) {
+      if (visibleRounds.has(round)) continue;
+      monumentRoot.remove(monument);
+      disposeObject(monument);
+      monuments.delete(round);
+      monumentBirths.delete(round);
+    }
+    for (const monument of next.monuments) {
+      if (monuments.has(monument.round)) continue;
+      const group = addMonument(monument);
+      if (next.round > previousRound && monument.round === previousRound && elapsed > 0) {
+        monumentBirths.set(monument.round, elapsed);
+        group.scale.setScalar(0.01);
+        burst(monument.center.x, monument.center.z, "monument");
+      }
+    }
+  };
+
+  setPit(currentPit);
+  populateScenery(0, 0);
   return {
-    update(_elapsedSeconds, playerX = 0, playerZ = 0) {
+    root,
+    ground,
+    pitTarget,
+    stones,
+    setStone(descriptor, visible = true) {
+      let mesh = stones.get(descriptor.id);
+      if (!mesh) {
+        mesh = new THREE.Mesh(rockGeometry, stoneMaterials[Math.abs(descriptor.material) % stoneMaterials.length]);
+        mesh.name = descriptor.id;
+        mesh.userData.stoneId = descriptor.id;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        stones.set(descriptor.id, mesh);
+        stoneRoot.add(mesh);
+      }
+      mesh.material = stoneMaterials[Math.abs(descriptor.material) % stoneMaterials.length];
+      mesh.position.set(descriptor.x, 0.27 * descriptor.scaleY, descriptor.z);
+      mesh.rotation.set(descriptor.rotationX * 0.22, descriptor.rotationY, descriptor.rotationZ * 0.22);
+      mesh.scale.set(descriptor.scaleX, descriptor.scaleY, descriptor.scaleZ);
+      mesh.visible = visible;
+      mesh.userData.descriptor = { ...descriptor };
+      return mesh;
+    },
+    setPit,
+    highlightStone(id) {
+      highlightedId = id;
+      marker.visible = id !== null && !!stones.get(id)?.visible;
+    },
+    burst,
+    update(elapsedSeconds, playerX = 0, playerZ = 0) {
+      if (disposed) return;
+      elapsed = Number.isFinite(elapsedSeconds) ? elapsedSeconds : elapsed;
       const safeX = Number.isFinite(playerX) ? playerX : 0;
       const safeZ = Number.isFinite(playerZ) ? playerZ : 0;
-      const nextChunkX = chunkAt(safeX);
-      const nextChunkZ = chunkAt(safeZ);
-      if (nextChunkX !== centerChunkX || nextChunkZ !== centerChunkZ) {
-        refreshChunks(nextChunkX, nextChunkZ);
-        centerChunkX = nextChunkX;
-        centerChunkZ = nextChunkZ;
+      sun.position.set(safeX - 24, 38, safeZ + 18);
+      sun.target.position.set(safeX, 0, safeZ);
+      const nextOriginX = Math.round(safeX / 128) * 128;
+      const nextOriginZ = Math.round(safeZ / 128) * 128;
+      if (nextOriginX !== groundOriginX || nextOriginZ !== groundOriginZ) {
+        groundOriginX = nextOriginX;
+        groundOriginZ = nextOriginZ;
+        ground.geometry.dispose();
+        ground.geometry = meadowGeometry(currentPit, groundOriginX, groundOriginZ);
       }
-
-      horizonRoot.position.set(safeX, 0, safeZ);
+      populateScenery(safeX, safeZ);
+      const selected = highlightedId ? stones.get(highlightedId) : undefined;
+      marker.visible = !!selected?.visible;
+      if (selected?.visible) {
+        marker.position.set(selected.position.x, 0.012, selected.position.z);
+        marker.scale.setScalar(1 + Math.sin(elapsed * 3) * 0.045);
+        markerMaterial.opacity = 0.68 + Math.sin(elapsed * 3) * 0.12;
+      }
+      let shadowCount = 0;
+      for (const stone of stones.values()) {
+        if (!stone.visible || stone.position.y > 0.8 || shadowCount >= stoneShadows.instanceMatrix.count) continue;
+        const size = 1.2 * Math.max(stone.scale.x, stone.scale.z);
+        setMatrix(stoneShadows, shadowCount++, stone.position.x + 0.09, -0.01, stone.position.z - 0.06, size, 1, size * 0.78);
+      }
+      stoneShadows.count = shadowCount;
+      stoneShadows.instanceMatrix.needsUpdate = true;
+      stoneShadows.computeBoundingSphere();
+      for (const [round, born] of monumentBirths) {
+        const progress = Math.min(1, Math.max(0, (elapsed - born) / 1.65));
+        const eased = 1 - Math.pow(1 - progress, 3);
+        monuments.get(round)?.scale.setScalar(Math.max(0.01, eased));
+        if (progress >= 1) monumentBirths.delete(round);
+      }
+      let particleCount = 0;
+      for (let index = particleStates.length - 1; index >= 0; index -= 1) {
+        const particle = particleStates[index];
+        const age = elapsed - particle.born;
+        if (age > particle.life || age < 0) {
+          particleStates.splice(index, 1);
+          continue;
+        }
+        const scale = Math.max(0, 1 - age / particle.life);
+        setMatrix(particles, particleCount++, particle.x + particle.vx * age, Math.max(0.03, 0.1 + particle.vy * age - 4.2 * age * age), particle.z + particle.vz * age, scale, scale, scale, age * 3);
+      }
+      particles.count = particleCount;
+      particles.instanceMatrix.needsUpdate = true;
     },
     dispose() {
-      worldDisposed = true;
-      environmentAbort.abort();
-      for (const installed of Object.values(authoredAssets)) {
-        authoredRoot.remove(installed.pool.root);
-        installed.pool.dispose();
-        installed.lease.dispose();
-      }
+      if (disposed) return;
+      disposed = true;
       scene.remove(root);
-      disposable.forEach((item) => item.dispose());
+      const released = disposeObject(root);
+      for (const material of stoneMaterials) {
+        if (!released.has(material)) material.dispose();
+      }
+      // InstancedMesh owns renderer-side matrix buffers in addition to geometry.
+      root.traverse((object) => { if (object instanceof THREE.InstancedMesh) object.dispose(); });
+      sun.shadow.dispose();
+      stones.clear();
+      monuments.clear();
+      particleStates.length = 0;
+      scene.background = previousBackground;
+      scene.fog = previousFog;
     },
   };
 }
+
+export type StorybookWorld = Pick<WaitingWorld, "update" | "dispose">;
+export const createStorybookWorld = createWaitingWorld;

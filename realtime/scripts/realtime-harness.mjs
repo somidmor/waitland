@@ -48,7 +48,7 @@ const webOrigin = checkedOrigin(
   "WEB_ORIGIN",
 );
 const clientCount = Math.floor(
-  mode === "smoke" ? 1 : numberSetting("CLIENTS", 64, 1, 512),
+  numberSetting("CLIENTS", mode === "smoke" ? 1 : 64, 1, mode === "smoke" ? 2 : 512),
 );
 const durationSeconds = numberSetting(
   "DURATION_SECONDS",
@@ -105,12 +105,20 @@ async function writeState(resumeTokens) {
   await chmod(stateFile, 0o600);
 }
 
+function validPit(pit) {
+  return pit && Number.isSafeInteger(pit.round) && pit.round > 0 &&
+    pit.capacity === pit.round * 100 && Number.isSafeInteger(pit.count) &&
+    pit.count >= 0 && pit.count < pit.capacity &&
+    Number.isFinite(pit.center?.x) && Number.isFinite(pit.center?.z) &&
+    Number.isFinite(pit.wallRadius) && Array.isArray(pit.monuments);
+}
+
 async function verifyFrontDoor() {
   const healthResponse = await fetch(new URL("/ready", realtimeOrigin), {
     signal: AbortSignal.timeout(10_000),
   });
   const health = await healthResponse.json().catch(() => null);
-  if (!healthResponse.ok || health?.ok !== true || health?.protocol !== 1) {
+  if (!healthResponse.ok || health?.ok !== true || health?.protocol !== 1 || !validPit(health?.pit)) {
     throw new Error(`Readiness check failed (${healthResponse.status}).`);
   }
 
@@ -143,10 +151,6 @@ async function createSession(index, resumeToken) {
     },
     body: JSON.stringify({
       profile: {
-        name: `Harness ${index + 1}`,
-        city: "Load Test",
-        countryCode: "CA",
-        countryFlag: "🇨🇦",
         waitReason: mode === "smoke" ? "Smoke test" : "Load test",
       },
       ...(typeof resumeToken === "string" && resumeToken ? { resumeToken } : {}),
@@ -185,6 +189,7 @@ function openSocket(index, session) {
       z: 0,
       heading: (index * 0.618) % (Math.PI * 2),
       seq: 0,
+      pit: undefined,
       expectedClose: false,
       movementTimer: undefined,
       heartbeatTimer: undefined,
@@ -210,7 +215,7 @@ function openSocket(index, session) {
         const self = Array.isArray(message.players)
           ? message.players.find((player) => player?.id === message.selfId)
           : undefined;
-        if (!self || typeof self.x !== "number" || typeof self.z !== "number") {
+        if (!self || typeof self.x !== "number" || typeof self.z !== "number" || !validPit(message.pit)) {
           clearTimeout(timeout);
           client.expectedClose = true;
           socket.close(4000, "invalid welcome");
@@ -219,6 +224,7 @@ function openSocket(index, session) {
         }
         welcomed = true;
         clearTimeout(timeout);
+        client.pit = message.pit;
         client.x = self.x;
         client.z = self.z;
         statistics.openedClients += 1;
@@ -226,7 +232,10 @@ function openSocket(index, session) {
         resolve(client);
         return;
       }
-      if (message.t === "frame") {
+      if (message.t === "pit") {
+        if (!validPit(message.pit)) recordFailure(`Client ${index + 1} received invalid pit state.`);
+        else client.pit = message.pit;
+      } else if (message.t === "frame") {
         statistics.frames += 1;
         if (typeof message.serverTime === "number") {
           statistics.frameAgeMilliseconds.push(Math.max(0, Date.now() - message.serverTime));
@@ -270,8 +279,8 @@ function startTraffic(client) {
     const step = Math.min(0.28, 3.2 / movesPerSecond);
     let nextX = client.x + Math.cos(client.heading) * step;
     let nextZ = client.z + Math.sin(client.heading) * step;
-    const radius = Math.hypot(nextX, nextZ);
-    if (radius < 7 || radius > 70) {
+    const radius = Math.hypot(nextX - client.pit.center.x, nextZ - client.pit.center.z);
+    if (radius < client.pit.wallRadius + 1 || radius > 70) {
       client.heading += Math.PI;
       nextX = client.x + Math.cos(client.heading) * step;
       nextZ = client.z + Math.sin(client.heading) * step;

@@ -6,11 +6,12 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
     "test": "node --import ./test/register-cloudflare-workers.mjs --experimental-transform-types --test test/*.test.ts",
-    "dev": "wrangler dev",
-    "verify": "npm run build && npm test",
+    "dev": "wrangler dev --config wrangler.jsonc --local-upstream localhost:8787",
+    "verify": "npm run build && npm test && npm run test:integration",
+    "test:integration": "node scripts/lifecycle-integration.mjs",
     "types:cloudflare": "wrangler types worker-configuration.d.ts --config wrangler.jsonc --include-runtime=false --strict-vars=false",
     "predeploy": "npm run verify",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy --config wrangler.jsonc",
     "secret:set": "wrangler secret put SESSION_SECRET",
     "smoke": "node scripts/realtime-harness.mjs --smoke",
     "load": "node scripts/realtime-harness.mjs --load"

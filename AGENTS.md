@@ -7,9 +7,9 @@ multiplayer protocol, 3D assets, or deployment workflow.
 ## Product in one paragraph
 
 Waitland is a portrait-first, account-free web game for people who are waiting.
-A visitor enters a name, city, country, and a simple reason for waiting, then
-spawns as a small stylized person in a shared 3D field. They can walk, carry one
-stone, throw it into a global pit, and speak to nearby people through short
+A visitor enters only a simple reason for waiting, then
+spawns as a small stylized person in a shared 3D field. They tap a rock to walk over and pick it up, then tap the pit to throw it.
+They can carry one stone and speak to nearby people through short
 speech bubbles. A visit may last one minute or one hour. There is no onboarding
 maze, inventory system, score grind, or required sign-in. Leaving should feel
 gentle: the visible character grows white wings and flies away. The server may
@@ -44,8 +44,10 @@ when the application moved to native Cloudflare Workers.
 - `app/`
   - `page.tsx` and `game-loader.tsx`: application entry and client loading.
   - `arrival-screen.tsx`: no-account arrival/profile flow.
-  - `waiting-pit.tsx`: main game orchestration, input, HUD, and realtime event
-    integration.
+  - `waiting-pit.tsx`: minimal React HUD, nearby bubbles, menu, and departure screen.
+  - `game-engine.ts`: Three.js loop, input, pickup/throw, realtime integration.
+  - `game-navigation.ts`: tap-to-walk routing around the active pit.
+  - `game-audio.ts`: optional synthesized stone sounds with no audio downloads.
   - `pit-geometry.ts`: the shared irregular excavation contours used by the
     meadow opening, dirt lip, wall, and floor.
   - `world-art.ts`: Three.js terrain, pit, stones, environment dressing,
@@ -58,8 +60,8 @@ when the application moved to native Cloudflare Workers.
   - `realtime-client.ts`: browser transport, reconnects, resume token, protocol
     validation, and local-only fallback.
 - `profile.ts`: validated local visitor profile and country/city metadata.
-    It intentionally retains the legacy `waiting-pit-profile-v1` local-storage
-    key so existing visitors keep their saved profiles.
+    It retains the legacy `waiting-pit-profile-v1` local-storage key and safely
+    accepts old profiles; new visits collect and display only a waiting reason.
   - `globals.css`: portrait HUD, safe-area behavior, responsive rules, and the
     warm miniature-world visual language.
 - `worker/index.ts`: web Worker entry point, image optimization, canonical host
@@ -86,10 +88,9 @@ when the application moved to native Cloudflare Workers.
 - `.github/workflows/deploy.yml`: gated production deployment and post-release
   HTTP/WebSocket verification.
 
-The `db/`, `drizzle/`, and `examples/d1/` directories are inactive starter
-scaffolding. Live gameplay does not use D1. Do not put movement, presence,
-stones, or chat into D1 polling. Remove the scaffolding in a dedicated cleanup
-change if it is no longer useful; never silently connect it to production.
+The unused D1/Drizzle starter scaffolding and dependencies were removed in the
+2026 rebuild. Live gameplay does not use D1. Do not put movement, presence,
+stones, or chat into database polling.
 
 ## Non-negotiable product constraints
 
@@ -100,8 +101,9 @@ change if it is no longer useful; never silently connect it to production.
    stone, carry it to the pit, and throw.
 4. One visitor may carry at most one stone.
 5. Short speech bubbles are proximity chat, not a persistent chat product.
-6. The pit is a shared global objective with a capacity of 1,000 stones in the
-   current prototype.
+6. The pit is a shared global objective: round one needs 100 stones, then each
+   round needs 100 more. Completion creates a named, dated statue and a larger
+   pit 26 units beside the previous one. The coordinator persists every statue.
 7. The player cannot enter the pit.
 8. Leaving displays a white-wing flight animation. Do not restore visible
    sleeping avatars.
@@ -236,14 +238,13 @@ Rules:
 
 ## Avatar and 3D asset boundary
 
-The local hero and every visible remote player now prefer one versioned,
-rigged Meshy GLB with idle, walk, and pick/throw clips. It is
-lazy-loaded behind `avatar/waitlander-manifest.ts`; decoded geometry and
-textures are shared while each visible player owns the skeleton and animation
-state required by Three.js. The deterministic procedural avatar remains the
-loading/error fallback; remote distance and instance options are explicit
-operational escape hatches rather than production defaults. Preserve these boundaries so
-customization does not require rewriting gameplay or transport:
+The rebuilt game defaults to lightweight, clearly colored procedural people,
+with instanced remote avatars. The existing versioned Meshy rig and animation
+runtime remain available behind `?avatar=rigged` for art evaluation. They are
+not downloaded during ordinary entry or play. World geometry, stone materials,
+monument sculptures, and scenery are procedural and reused; old environment
+assets are retained as optional art sources, not fetched by the live scene.
+Preserve these boundaries so customization does not require rewriting gameplay or transport:
 
 - Profile/avatar selection produces a stable avatar descriptor.
 - `avatar-design.ts` maps that descriptor to visual parts/material choices.

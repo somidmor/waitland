@@ -443,3 +443,20 @@ test("remote GLB tint recovers black material factors and is idempotent", () => 
   );
   material.dispose();
 });
+
+test("zero rigged caps keep the production crowd procedural without starting an asset load", async () => {
+  const scene = new THREE.Scene();
+  let loads = 0;
+  const renderer = new RemoteAvatarRenderer(scene, {
+    maxRiggedPlayers: 0,
+    mobileRiggedPlayers: 0,
+    riggedAvatarLoader: async () => { loads += 1; return { ok: false, reason: "load-failed" }; },
+  });
+  const camera = makeCamera();
+  renderer.upsert({ id: "procedural-visitor", x: 0, z: 0, yaw: 0, moving: false });
+  for (let index = 0; index < 3; index += 1) frame(renderer, camera, performance.now() + index * 16);
+  await Promise.resolve();
+  assert.equal(loads, 0);
+  assert.equal(renderer.getRenderMode("procedural-visitor"), "procedural");
+  renderer.dispose();
+});
