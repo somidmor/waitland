@@ -35,7 +35,8 @@ test("the arrival screen stays independent from 3D and external image downloads"
     readFile(new URL("../app/arrival-screen.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/game-loader.tsx", import.meta.url), "utf8"),
   ]);
-  assert.doesNotMatch(arrival, /from ["']three|\.glb|<img\b|https:\/\//);
+  assert.doesNotMatch(arrival, /from ["']three|\.glb|https:\/\//);
+  assert.match(arrival, /src="\/field-preview\.webp"/);
   assert.match(loader, /if \(!activeProfile \|\| Game\) return;[\s\S]*import\("\.\/waiting-pit"\)/);
   assert.match(loader, /catch \{[\s\S]*session still works when storage is unavailable/);
 });

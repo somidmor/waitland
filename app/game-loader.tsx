@@ -114,8 +114,8 @@ export default function GameLoader() {
     return (
       <main className="loading-shell" aria-label="The field could not open">
         <span className="loading-pit" aria-hidden="true" />
-        <h1>A small pause.</h1>
-        <p>The field couldn’t load. Let’s give it another try.</p>
+        <h1>The field couldn’t load.</h1>
+        <p>Check your connection and try again.</p>
         <button
           type="button"
           className="loading-retry"
@@ -134,7 +134,7 @@ export default function GameLoader() {
   return (
     <main className="loading-shell" aria-label="Opening Waitland">
       <span className="loading-pit" aria-hidden="true" />
-      <p>A little room for your wait…</p>
+      <p>Opening the field…</p>
     </main>
   );
 }

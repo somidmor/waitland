@@ -3,11 +3,11 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://waitland.app"),
-  title: "Waitland — A little wait. Something lasting.",
-  description: "Waiting for something? Pick up a rock, toss it in the shared pit, and help strangers build a monument. No accounts. Just a little of your time.",
+  title: "Waitland — Throw rocks while you wait.",
+  description: "Waiting for something? Pick up a rock, toss it in the shared pit, and help strangers build a monument. Open the field and play. No account needed.",
   openGraph: {
-    title: "Waitland — A little wait. Something lasting.",
-    description: "Pick up a rock. Toss it in the pit. Together, turn the waiting into a monument.",
+    title: "Waitland — Throw rocks while you wait.",
+    description: "Pick up a rock. Toss it in the pit. Fill a shared pit and build a dated stone statue.",
     url: "/",
     siteName: "Waitland",
     type: "website",
@@ -16,14 +16,14 @@ export const metadata: Metadata = {
         url: "/og.png",
         width: 1200,
         height: 630,
-        alt: "Waitland, a shared little world where waiting becomes a monument",
+        alt: "Waitland, a shared sculpture park built one rock at a time",
       },
     ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "Waitland — A little wait. Something lasting.",
-    description: "Pick up a rock. Toss it in the pit. Together, turn the waiting into a monument.",
+    title: "Waitland — Throw rocks while you wait.",
+    description: "Pick up a rock. Toss it in the pit. Fill a shared pit and build a dated stone statue.",
     images: ["/og.png"],
   },
   icons: {
@@ -36,7 +36,7 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
-  themeColor: "#f5f1e7",
+  themeColor: "#f6f2e7",
 };
 
 export default function RootLayout({

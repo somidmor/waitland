@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { CARRY_SPEED, WALK_SPEED, PICKUP_RADIUS, FIELD_STONE_COUNT, getStoneDescriptor, parseStoneIndex, clampPositionOutsidePit, createInitialPitState, advancePitState, parsePitState, type PitState } from "../shared/world";
+import { CARRY_SPEED, WALK_SPEED, PICKUP_RADIUS, FIELD_STONE_COUNT, getStoneDescriptor, parseStoneIndex, clampPositionOutsidePit, createInitialPitState, advancePitState, parsePitState, type PitMonument, type PitState } from "../shared/world";
 import { createProceduralAvatar, type RiggedAvatarRuntime } from "./avatar";
 import { createAvatarAppearance } from "./avatar-design";
 import { WAITLANDER_RUNTIME_MANIFEST } from "./avatar/waitlander-manifest";
@@ -12,6 +12,10 @@ import type { WaitProfile } from "./profile";
 
 const LOCAL_PIT_KEY = "waitland-local-pit-v2";
 export type GameAction = "pick" | "walk" | "throw" | "busy";
+export type WorldAnchors = {
+  hero: { screenX: number; screenY: number; visible: boolean };
+  monuments: Array<{ round: number; screenX: number; screenY: number; visible: boolean }>;
+};
 export type GameCallbacks = {
   onPit: (pit: PitState) => void;
   onStatus: (status: RealtimeStatus) => void;
@@ -20,6 +24,8 @@ export type GameCallbacks = {
   onToast: (message: string) => void;
   onDeposit: () => void;
   onSpeech: (anchors: readonly RemoteAvatarAnchor[]) => void;
+  onWorldAnchors: (anchors: WorldAnchors) => void;
+  onInspectMonument: (monument: PitMonument | null) => void;
   onLeave: () => void;
   onError: () => void;
 };
@@ -44,18 +50,19 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
   mount.appendChild(renderer.domElement);
   const scene = new THREE.Scene();
   const world = createWaitingWorld(scene);
+  const baseFog = scene.fog instanceof THREE.Fog ? { near: scene.fog.near, far: scene.fog.far } : null;
   const camera = new THREE.OrthographicCamera(-16, 16, 25, -25, 0.1, 220);
   const player = new THREE.Group();
   player.position.set(0, 0, 18);
   scene.add(player);
-  const avatar = createProceduralAvatar({ seed: "local", groundShadow: true, castShadow: true });
+  const localAppearance = (id: string) => createAvatarAppearance(id, { sweater: 0xd9784e, trousers: 0x26382f, topId: "camp-shirt", baseId: "soft-rounded", accessoryIds: [] });
+  const avatar = createProceduralAvatar({ seed: "local", appearance: localAppearance("local"), scale: 1.12, groundShadow: true, castShadow: true });
   player.add(avatar.root);
   let rigged: RiggedAvatarRuntime | null = null;
   const abort = new AbortController();
   let disposed = false;
-  // The tiny colored person is the production art direction. Keep the authored
-  // rig available for explicit asset evaluation without charging every visitor
-  // its model/texture download or overriding the readable clothing palette.
+  // The authored rig remains available for asset evaluation; player identity
+  // is carried independently by the screen-space flag and ground ring.
   const useRiggedAvatar = new URLSearchParams(window.location.search).get("avatar") === "rigged";
   if (useRiggedAvatar) void import("./avatar/rigged-avatar-runtime").then(async ({ loadRiggedAvatar }) => {
     const result = await loadRiggedAvatar(WAITLANDER_RUNTIME_MANIFEST, { signal: abort.signal, castShadow: true });
@@ -67,6 +74,7 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
   }).catch(() => undefined);
   const remote = new RemoteAvatarRenderer(scene, { maxRiggedPlayers: useRiggedAvatar ? 12 : 0, mobileRiggedPlayers: useRiggedAvatar ? 8 : 0, riggedDistance: 28 });
   const players = new Map<string, RealtimePlayer>();
+  let remoteAnchors: readonly RemoteAvatarAnchor[] = [];
   const stones = new Map<string, RealtimeStone>();
   const audio = new StoneAudio();
   let pit = createInitialPitState(Date.now());
@@ -95,7 +103,23 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
   const desiredLook = new THREE.Vector3();
   const celebrationFocus = new THREE.Vector3();
   let celebrationUntil = 0;
-  const cameraOffset = new THREE.Vector3(13, 28, 29);
+  let celebrationHalfWidth = 1;
+  const cameraOffset = new THREE.Vector3(9, 29, 31);
+  let arrivalOriented = false;
+  let inspectedMonument: PitMonument | null = null;
+  const projected = new THREE.Vector3();
+  const cameraForward = new THREE.Vector3();
+  const cameraRight = new THREE.Vector3();
+  const focusDelta = new THREE.Vector3();
+  const heroRing = new THREE.Group();
+  for (const [inner, outer, color] of [[0.98, 1.18, 0xfffae9], [1.18, 1.28, 0x26382f]]) {
+    const ring = new THREE.Mesh(new THREE.RingGeometry(inner, outer, 48), new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, depthWrite: false }));
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.06;
+    heroRing.add(ring);
+  }
+  heroRing.name = "local-player-ring";
+  scene.add(heroRing);
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
   const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -118,6 +142,13 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
     return wing;
   });
 
+  function inspectMonument(round: number | null) {
+    inspectedMonument = round === null ? null : pit.monuments.find((item) => item.round === round) ?? null;
+    destination = null;
+    callbacks.onInspectMonument(inspectedMonument);
+  }
+  function endInspection() { if (inspectedMonument) inspectMonument(null); }
+
   function applyPit(next: PitState, celebrate = true) {
     if (hasJoined && (next.round < pit.round || (next.round === pit.round && next.count < pit.count))) return;
     const previous = pit;
@@ -130,10 +161,13 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
     world.setPit(pit);
     callbacks.onPit(pit);
     if (celebrate && next.round > previous.round) {
-      callbacks.onToast("We made a statue. A bigger pit is waiting →");
+      callbacks.onToast("Statue complete. The next pit is open.");
       world.burst(previous.center.x, previous.center.z, "monument");
       audio.play("monument");
-      celebrationFocus.set((previous.center.x + next.center.x) / 2, 0, (previous.center.z + next.center.z) / 2 + 3);
+      celebrationFocus.set((previous.center.x + next.center.x) / 2, 0, (previous.center.z + next.center.z) / 2);
+      const viewLength = Math.hypot(cameraOffset.x, cameraOffset.z);
+      const horizontalSpan = Math.abs((next.center.x - previous.center.x) * cameraOffset.z / viewLength - (next.center.z - previous.center.z) * cameraOffset.x / viewLength);
+      celebrationHalfWidth = horizontalSpan / 2 + Math.max(previous.radius, next.wallRadius) + 3;
       celebrationUntil = performance.now() + 4200;
       destination = null;
     }
@@ -197,7 +231,7 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
     rigged?.playInteraction({ kind: "pickup", restart: true });
     interaction = { kind: "pickup", startedAt: performance.now() };
     audio.play("pickup");
-    callbacks.onToast("One little rock. Tap the pit.");
+    callbacks.onToast("Rock picked up. Tap the pit to throw.");
   }
   function beginFlight(id: string, targetPit: PitState, deposited: boolean) {
     const mesh = world.stones.get(id);
@@ -263,9 +297,16 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
       applyPit(message.pit, false);
       hasJoined = true;
       selfId = message.selfId;
-      avatar.setAppearance(createAvatarAppearance(selfId));
+      avatar.setAppearance(localAppearance(selfId));
       const self = message.players.find((entry) => entry.id === selfId);
       if (self) { player.position.set(self.x, 0, self.z); player.rotation.y = self.heading; }
+      if (!arrivalOriented) {
+        // Arrival may be anywhere around the shared pit. View from the visitor's
+        // side so the hero is foreground and the objective is beyond them.
+        const angle = Math.atan2(player.position.x - pit.center.x, player.position.z - pit.center.z);
+        cameraOffset.set(Math.sin(angle) * 32, 29, Math.cos(angle) * 32);
+        arrivalOriented = true;
+      }
       lookAt.set(player.position.x * 0.4 + pit.center.x * 0.6, 0, player.position.z * 0.4 + pit.center.z * 0.6);
       stones.clear();
       for (const mesh of world.stones.values()) mesh.visible = false;
@@ -385,6 +426,7 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
     return closest;
   }
   function action() {
+    endInspection();
     if (held) throwRock();
     else { const closest = closestStone(); if (closest) takeRock(closest.id); }
   }
@@ -396,6 +438,19 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
     const rect = renderer.domElement.getBoundingClientRect();
     pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
     raycaster.setFromCamera(pointer, camera);
+    const nearbyVisitor = remoteAnchors.find((anchor) => !anchor.departing && anchor.distance < 24 && Math.abs(anchor.screenX - (event.clientX - rect.left)) < 24 && event.clientY - rect.top > anchor.screenY && event.clientY - rect.top < anchor.screenY + 66);
+    if (nearbyVisitor) {
+      const reason = players.get(nearbyVisitor.id)?.profile.waitReason;
+      if (reason) remote.setSpeech(nearbyVisitor.id, `Waiting for ${reason}`, Date.now() + 6000);
+      return;
+    }
+    const monumentHit = raycaster.intersectObjects([...world.monuments.values()], true)[0];
+    if (monumentHit) {
+      let target: THREE.Object3D | null = monumentHit.object;
+      while (target && !target.userData.monument) target = target.parent;
+      if (target?.userData.monument) { inspectMonument((target.userData.monument as PitMonument).round); return; }
+    }
+    endInspection();
     const targets = [...world.stones.values()].filter((mesh) => mesh.visible && !stones.get(String(mesh.userData.stoneId))?.holderId);
     const hits = raycaster.intersectObjects([world.pitTarget, ...targets], false);
     const object = hits[0]?.object;
@@ -429,7 +484,7 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
     width = Math.max(mount.clientWidth, 1);
     height = Math.max(mount.clientHeight, 1);
     const aspect = width / height;
-    const halfHeight = aspect < 0.8 ? 23 : 20;
+    const halfHeight = aspect < 0.8 ? Math.min(18.5, Math.max(14.5, height / 45.5)) : 18;
     camera.left = -halfHeight * aspect;
     camera.right = halfHeight * aspect;
     camera.top = halfHeight;
@@ -467,6 +522,7 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
       let sz = joystick.z + Number(keys.has("s") || keys.has("arrowdown")) - Number(keys.has("w") || keys.has("arrowup"));
       const strength = Math.hypot(sx, sz);
       if (strength > 0.08) {
+        endInspection();
         destination = null;
         sx /= Math.max(strength, 1); sz /= Math.max(strength, 1);
         const angle = Math.atan2(cameraOffset.x, cameraOffset.z);
@@ -572,18 +628,53 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
     const pitDistance = Math.hypot(player.position.x - pit.center.x, player.position.z - pit.center.z);
     const focusWeight = Math.min(0.6, 12 / Math.max(1, pitDistance));
     desiredLook.set(player.position.x * (1 - focusWeight) + pit.center.x * focusWeight, 0, player.position.z * (1 - focusWeight) + pit.center.z * focusWeight);
-    const celebrating = now < celebrationUntil && !destination && leavingAt === null;
+    cameraForward.set(cameraOffset.x, 0, cameraOffset.z).normalize();
+    cameraRight.set(cameraForward.z, 0, -cameraForward.x);
+    focusDelta.copy(desiredLook).sub(player.position);
+    const sideFocus = THREE.MathUtils.clamp(focusDelta.dot(cameraRight), -camera.right * 0.52, camera.right * 0.52);
+    const depthFocus = THREE.MathUtils.clamp(focusDelta.dot(cameraForward), -camera.top * 0.45, camera.top * 0.45);
+    desiredLook.copy(player.position).setY(0).addScaledVector(cameraRight, sideFocus).addScaledVector(cameraForward, depthFocus);
+    const celebrating = now < celebrationUntil && !destination && leavingAt === null && !inspectedMonument;
     if (celebrating) desiredLook.copy(celebrationFocus);
-    const desiredZoom = celebrating && width < height ? 0.72 : 1;
+    if (inspectedMonument) {
+      // Keep the sculpture in the clear upper part of the view above its plaque.
+      desiredLook.set(inspectedMonument.center.x, 0, inspectedMonument.center.z);
+      desiredLook.addScaledVector(cameraForward, width < height ? 5 : 0);
+    }
+    const desiredZoom = celebrating ? Math.min(0.85, camera.right / celebrationHalfWidth) : inspectedMonument ? 1.08 : 1;
     camera.zoom += (desiredZoom - camera.zoom) * (reducedMotion ? 1 : Math.min(1, dt * 3));
     camera.updateProjectionMatrix();
     lookAt.lerp(desiredLook, reducedMotion ? 1 : 1 - Math.exp(-dt * 3));
-    camera.position.copy(lookAt).add(cameraOffset);
+    // Zooming an orthographic view out expands ray origins vertically. Move
+    // the camera back as well so the lower frustum never starts below ground.
+    const cameraDistanceScale = Math.max(1, 1 / camera.zoom);
+    camera.position.copy(lookAt).addScaledVector(cameraOffset, cameraDistanceScale);
+    if (baseFog && scene.fog instanceof THREE.Fog) {
+      const extraDistance = cameraOffset.length() * (cameraDistanceScale - 1);
+      scene.fog.near = baseFog.near + extraDistance;
+      scene.fog.far = baseFog.far + extraDistance;
+    }
     camera.lookAt(lookAt);
     marker.visible = Boolean(destination);
     if (destination) marker.position.set(destination.x, 0.08, destination.z);
-    world.update(now / 1000, player.position.x, player.position.z);
+    heroRing.position.set(player.position.x, 0, player.position.z);
+    heroRing.visible = leavingAt === null && !inspectedMonument;
+    world.update(now / 1000, player.position.x, player.position.z, Math.atan2(cameraOffset.x, cameraOffset.z));
+    scene.updateMatrixWorld();
+    camera.updateMatrixWorld();
+    (rigged?.anchors.speech ?? avatar.anchors.speech).getWorldPosition(projected);
+    projected.y += 0.32;
+    projected.project(camera);
+    const hero = { screenX: (projected.x + 1) * width / 2, screenY: (1 - projected.y) * height / 2, visible: leavingAt === null && !inspectedMonument && Math.abs(projected.x) < 0.92 && Math.abs(projected.y) < 0.86 };
+    const monumentAnchors = pit.monuments.map((monument) => {
+      projected.set(monument.center.x, 0.4, monument.center.z);
+      projected.addScaledVector(cameraForward, monument.radius * 0.82);
+      projected.project(camera);
+      return { round: monument.round, screenX: (projected.x + 1) * width / 2, screenY: (1 - projected.y) * height / 2, visible: !inspectedMonument && Math.abs(projected.x) < 1.05 && Math.abs(projected.y) < 0.72 };
+    });
+    callbacks.onWorldAnchors({ hero, monuments: monumentAnchors });
     remote.update(now, dt, camera, player.position, { width, height }, (anchors) => {
+      remoteAnchors = anchors;
       if (uiClock > 0.1) callbacks.onSpeech(anchors.slice(0, 8).map((anchor) => ({
         ...anchor,
         speech: anchor.speechExpiresAt && anchor.speechExpiresAt <= Date.now() ? undefined : anchor.speech,
@@ -604,12 +695,13 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
   frame = requestAnimationFrame(animate);
   return {
     action,
+    inspectMonument,
     setJoystick(x: number, z: number) { joystick.x = x; joystick.z = z; },
     setSound(enabled: boolean) { audio.enabled = enabled; if (enabled) audio.play("pickup"); },
     setProfile(next: WaitProfile) { realtime.setProfile(next); },
-    speak(text: string) { if (!realtime.sendChat(text)) callbacks.onToast("Your words are just for you while offline."); },
+    speak(text: string) { if (!realtime.sendChat(text)) callbacks.onToast("Chat is unavailable offline."); },
     leave() { if (leavingAt !== null) return; leavingAt = performance.now(); destination = null; realtime.stop(); },
-    goToPit() { destination = pitApproach(player.position, pit); },
+    goToPit() { endInspection(); destination = pitApproach(player.position, pit); },
     dispose() {
       disposed = true;
       cancelAnimationFrame(frame);
@@ -627,6 +719,7 @@ export function createGameEngine(mount: HTMLDivElement, profile: WaitProfile, ca
       remote.dispose();
       rigged?.dispose();
       avatar.dispose();
+      heroRing.children.forEach((child) => { if (child instanceof THREE.Mesh) { child.geometry.dispose(); child.material.dispose(); } });
       marker.geometry.dispose();
       marker.material.dispose();
       wingGeometry.dispose();

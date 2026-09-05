@@ -34,10 +34,14 @@ test("meadow has a real opening which follows the growing pit and closes beneath
   assert.ok(active.scale.x > 1, "the new excavation is larger");
   const monument = world.root.getObjectByName("monument-1");
   assert.ok(monument instanceof THREE.Group);
-  const plaque = monument.getObjectByName("monument-plaque-1");
-  assert.match(plaque.userData.label, /A little patience/);
-  assert.match(plaque.userData.label, /100 stones/);
-  assert.match(plaque.userData.label, /2026/);
+  assert.equal(world.monuments.get(1), monument);
+  assert.equal(monument.userData.monument.name, "A little patience");
+  assert.equal(monument.userData.monument.stoneCount, 100);
+  assert.equal(monument.userData.monument.completedAt, 1_783_209_600_000);
+  assert.ok(monument.userData.labelHeight > 5, "DOM labels receive a stable world anchor above the sculpture");
+  let spriteCount = 0;
+  monument.traverse((object) => { if (object instanceof THREE.Sprite) spriteCount += 1; });
+  assert.equal(spriteCount, 0, "monument text belongs to the readable screen-space overlay");
   assert.ok(monument.getObjectByName("stone-sculpture").children.length > 3);
   world.update(3);
   assert.equal(monument.scale.x, 1, "the new statue finishes its reveal animation");

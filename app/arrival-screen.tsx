@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { WAIT_REASONS, createWaitProfile, type WaitProfile } from "./profile";
 
 type ArrivalScreenProps = {
@@ -11,30 +12,6 @@ type ArrivalScreenProps = {
   onCancel?: () => void;
 };
 const subscribeToHydration = () => () => undefined;
-
-function StoneGarden() {
-  return (
-    <div className="arrival-preview" aria-hidden="true">
-      <div className="preview-orbit" />
-      <div className="preview-sun" />
-      <div className="preview-ground" />
-      <div className="preview-pit" />
-      <div className="preview-cairn">
-        <i className="preview-rock preview-rock--base" />
-        <i className="preview-rock preview-rock--middle" />
-        <i className="preview-rock preview-rock--top" />
-      </div>
-      <i className="preview-pebble preview-pebble--one" />
-      <i className="preview-pebble preview-pebble--two" />
-      <i className="preview-pebble preview-pebble--three" />
-      <div className="preview-person"><i /><b /><span /></div>
-      <span className="preview-grass preview-grass--one" />
-      <span className="preview-grass preview-grass--two" />
-      <span className="preview-caption">Small moments. Solid things.</span>
-      <span className="preview-annotation"><span /> MADE TOGETHER</span>
-    </div>
-  );
-}
 
 export default function ArrivalScreen({ initialProfile, mode, onComplete, onCancel }: ArrivalScreenProps) {
   const hydrated = useSyncExternalStore(subscribeToHydration, () => true, () => false);
@@ -78,27 +55,24 @@ export default function ArrivalScreen({ initialProfile, mode, onComplete, onCanc
 
   const form = (
     <form className="arrival-form" onSubmit={submit} aria-busy={!hydrated}>
-      <label htmlFor="wait-reason">What are you waiting for?</label>
-      <div className={`arrival-input-wrap${error ? " has-error" : ""}`}>
-        <input
-          ref={inputRef}
-          id="wait-reason"
-          name="reason"
-          type="text"
-          readOnly={!hydrated}
-          placeholder="My coffee, a friend, a fresh start…"
-          value={reason}
-          onChange={(event) => { setReason(event.target.value); setError(false); }}
-          maxLength={50}
-          autoComplete="off"
-          enterKeyHint="go"
-          aria-invalid={error || undefined}
-          aria-describedby={error ? "arrival-error" : "arrival-privacy"}
-        />
-        <span className="arrival-input-dot" aria-hidden="true" />
-      </div>
-      <div className="arrival-reasons" aria-label="A few ideas">
-        {WAIT_REASONS.map((shortcut) => (
+      <label className="sr-only" htmlFor="wait-reason">What are you waiting for?</label>
+      <input
+        ref={inputRef}
+        id="wait-reason"
+        name="reason"
+        type="text"
+        readOnly={!hydrated}
+        placeholder="My coffee, a friend, the train…"
+        value={reason}
+        onChange={(event) => { setReason(event.target.value); setError(false); }}
+        maxLength={50}
+        autoComplete="off"
+        enterKeyHint="go"
+        aria-invalid={error || undefined}
+        aria-describedby={error ? "arrival-error" : "arrival-privacy"}
+      />
+      <div className="arrival-reasons" aria-label="Choose a waiting reason">
+        {WAIT_REASONS.slice(0, 4).map((shortcut) => (
           <button
             key={shortcut.id}
             type="button"
@@ -107,16 +81,16 @@ export default function ArrivalScreen({ initialProfile, mode, onComplete, onCanc
             aria-pressed={reason.toLowerCase() === shortcut.phrase.toLowerCase()}
             onClick={() => { setReason(shortcut.phrase); setError(false); }}
           >
-            {shortcut.label}
+            {shortcut.label.replace("☕ ", "")}
           </button>
         ))}
       </div>
-      {error ? <p id="arrival-error" className="arrival-error" role="alert">A word or two is enough. Or pick an idea above.</p> : null}
+      {error ? <p id="arrival-error" className="arrival-error" role="alert">Enter a reason, or choose one above.</p> : null}
       <button className="arrival-submit" type="submit" disabled={!hydrated}>
-        <span>{editing ? "Back to the field" : "Let’s make something"}</span>
-        <span className="arrow-icon" aria-hidden="true">↗</span>
+        <span>{editing ? "Save and return" : "Enter the field"}</span>
+        <span aria-hidden="true">→</span>
       </button>
-      <p className="arrival-privacy" id="arrival-privacy">{editing ? "Your reason is visible to people nearby." : "No accounts. Just a little of your time."}</p>
+      <p className="arrival-privacy" id="arrival-privacy">{editing ? "Your reason is visible to people nearby." : "No account needed. Your reason appears nearby."}</p>
     </form>
   );
 
@@ -125,8 +99,7 @@ export default function ArrivalScreen({ initialProfile, mode, onComplete, onCanc
       <div className="arrival-editor" onClick={(event) => { if (event.target === event.currentTarget) onCancel?.(); }}>
         <div ref={dialogRef} className="arrival-edit-card" role="dialog" aria-modal="true" aria-labelledby="arrival-edit-title">
           <button className="arrival-close" type="button" onClick={onCancel} aria-label="Close">×</button>
-          <p className="arrival-eyebrow">STILL A LITTLE TIME?</p>
-          <h1 id="arrival-edit-title">Life can wait.<br />For a moment.</h1>
+          <h1 id="arrival-edit-title">What are you waiting for?</h1>
           {form}
         </div>
       </div>
@@ -136,19 +109,18 @@ export default function ArrivalScreen({ initialProfile, mode, onComplete, onCanc
   return (
     <main className="arrival-shell">
       <header className="arrival-header">
-        <Link className="arrival-brand" href="/" aria-label="Waitland home"><span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>waitland<span className="brand-period">.</span></Link>
-        <span className="arrival-header-note"><i /> A GOOD PLACE TO WAIT</span>
+        <Link className="arrival-brand" href="/" aria-label="Waitland home"><span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>waitland</Link>
+        <span className="arrival-header-note">A shared field.</span>
       </header>
       <div className="arrival-content">
         <section className="arrival-intro" aria-labelledby="arrival-title">
-          <p className="arrival-eyebrow">TURN A LITTLE TIME INTO SOMETHING.</p>
-          <h1 id="arrival-title">A little wait.<br /><em>Something<br className="desktop-break" /> lasting.</em></h1>
-          <p className="arrival-description">Pick up a rock. Toss it in the pit.<br />Together, we’ll turn the waiting into a monument.</p>
+          <h1 id="arrival-title">What are you<br />waiting for?</h1>
+          <p className="arrival-description">Pick up rocks. Fill a shared pit.<br />Build a statue together.</p>
+          {form}
         </section>
-        <StoneGarden />
-        {form}
+        <figure className="arrival-scene"><Image src="/field-preview.webp" width={1200} height={750} unoptimized alt="A stone statue beside a shared pit in Waitland" /></figure>
       </div>
-      <footer className="arrival-footer"><span>ONE ROCK AT A TIME.</span><span>Come for a minute. Leave a little mark.</span></footer>
+      <footer className="arrival-footer">Every full pit becomes a dated statue. Then a bigger pit opens.</footer>
     </main>
   );
 }

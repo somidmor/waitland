@@ -269,7 +269,7 @@ test("the rebuilt meadow reaches first interaction without authored environment 
     "utf8",
   );
   assert.doesNotMatch(sceneSource, /loadEnvironmentAsset|TextureLoader|GLTFLoader/);
-  assert.match(sceneSource, /monumentPlaque/);
+  assert.match(sceneSource, /userData\.monument/);
 });
 
 test("an aborted in-flight environment load cannot install or leak its late GLB", async () => {

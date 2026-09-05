@@ -19,12 +19,12 @@ import {
 
 /** One deliberately small palette keeps the action legible on a phone. */
 export const WORLD_COLORS = {
-  sky: 0xdde6d4,
-  grass: 0xa8c19a,
-  grassDark: 0x8fa988,
-  leaf: 0x78957c,
-  leafLight: 0x97b092,
-  bark: 0x9e937a,
+  sky: 0xd7dec4,
+  grass: 0xaebb94,
+  grassDark: 0x7c9165,
+  leaf: 0x4f6b49,
+  leafLight: 0x72895b,
+  bark: 0x8d7354,
   earth: 0xb0a185,
   pit: 0x46543d,
   stone: [0xd3c8b4, 0xbeb8a6, 0xe0d3bc, 0xaaa994],
@@ -39,11 +39,12 @@ export type WaitingWorld = {
   ground: THREE.Mesh;
   pitTarget: THREE.Mesh;
   stones: Map<string, StoneMesh>;
+  readonly monuments: ReadonlyMap<number, THREE.Group>;
   setStone(descriptor: StoneDescriptor, visible?: boolean): StoneMesh;
   setPit(pit: PitState): void;
   highlightStone(id: string | null): void;
   burst(x: number, z: number, kind?: "deposit" | "monument"): void;
-  update(elapsedSeconds: number, playerX?: number, playerZ?: number): void;
+  update(elapsedSeconds: number, playerX?: number, playerZ?: number, viewAngle?: number): void;
   dispose(): void;
 };
 
@@ -118,40 +119,47 @@ function shadowTexture() {
   return texture;
 }
 
-function monumentPlaque(monument: PitMonument) {
-  const date = new Date(monument.completedAt).toLocaleDateString("en-US", {
-    day: "numeric", month: "short", year: "numeric", timeZone: "UTC",
-  });
-  const label = `${monument.name} · ${monument.stoneCount.toLocaleString("en-US")} stones · ${date}`;
-  const group = new THREE.Group();
-  group.name = `monument-plaque-${monument.round}`;
-  group.userData.label = label;
-  group.position.set(0, 0.85, monument.radius * 0.75 + 1.1);
-  if (typeof document === "undefined") return group;
-  const canvas = document.createElement("canvas");
-  canvas.width = 768;
-  canvas.height = 208;
-  const context = canvas.getContext("2d");
-  if (!context) return group;
-  context.fillStyle = "rgba(252,249,238,0.96)";
-  context.beginPath();
-  context.roundRect(8, 8, 752, 184, 35);
-  context.fill();
-  context.fillStyle = "#52654c";
-  context.textAlign = "center";
-  context.font = "600 40px system-ui, sans-serif";
-  context.fillText(monument.name, 384, 80, 692);
-  context.fillStyle = "#7a8370";
-  context.font = "400 27px system-ui, sans-serif";
-  context.fillText(`${monument.stoneCount.toLocaleString("en-US")} stones · ${date}`, 384, 131, 692);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
-  const sprite = new THREE.Sprite(material);
-  sprite.scale.set(5.8, 1.57, 1);
-  sprite.renderOrder = 3;
-  group.add(sprite);
-  return group;
+/** A softly irregular painted shape for moss beds and worn paths. */
+function parkPatchGeometry() {
+  const geometry = new THREE.CircleGeometry(1, 40).rotateX(-Math.PI / 2);
+  const positions = geometry.getAttribute("position");
+  for (let index = 1; index < positions.count; index += 1) {
+    const x = positions.getX(index);
+    const z = positions.getZ(index);
+    const angle = Math.atan2(z, x);
+    const radius = 1 + Math.sin(angle * 3 + 0.4) * 0.1 + Math.sin(angle * 5 - 0.8) * 0.045;
+    positions.setXYZ(index, x * radius, 0, z * radius);
+  }
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+function parkPathGeometry(points: readonly THREE.Vector3[], width: number) {
+  const curve = new THREE.CatmullRomCurve3([...points]);
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const segments = 64;
+  for (let index = 0; index <= segments; index += 1) {
+    const t = index / segments;
+    const point = curve.getPoint(t);
+    const tangent = curve.getTangent(t);
+    const ripple = 1 + Math.sin(t * 31) * 0.035 + Math.cos(t * 17) * 0.035;
+    const halfWidth = width * 0.5 * ripple;
+    const normalX = -tangent.z;
+    const normalZ = tangent.x;
+    positions.push(point.x + normalX * halfWidth, -0.007, point.z + normalZ * halfWidth,
+      point.x - normalX * halfWidth, -0.007, point.z - normalZ * halfWidth);
+    if (index < segments) {
+      const vertex = index * 2;
+      indices.push(vertex, vertex + 2, vertex + 1, vertex + 1, vertex + 2, vertex + 3);
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  return geometry;
 }
 
 function disposeObject(root: THREE.Object3D) {
@@ -182,9 +190,9 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
   const root = new THREE.Group();
   root.name = "waiting-world";
   scene.add(root);
-  const hemisphere = new THREE.HemisphereLight(0xfff9e9, 0x829376, 1.75);
+  const hemisphere = new THREE.HemisphereLight(0xf0f5f0, 0x637455, 1.55);
   root.add(hemisphere);
-  const sun = new THREE.DirectionalLight(0xffefd3, 2.4);
+  const sun = new THREE.DirectionalLight(0xfff4e6, 2.45);
   sun.position.set(-24, 38, 18);
   sun.castShadow = true;
   sun.shadow.mapSize.set(1024, 1024);
@@ -196,11 +204,12 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
   sun.shadow.camera.far = 100;
   sun.shadow.normalBias = 0.04;
   sun.shadow.bias = -0.0001;
-  sun.shadow.radius = 3;
+  sun.shadow.radius = 4;
   root.add(sun, sun.target);
 
   const roughMaterial = (color: THREE.ColorRepresentation) => new THREE.MeshStandardMaterial({ color, roughness: 1, metalness: 0 });
   const grassMaterial = roughMaterial(WORLD_COLORS.grass);
+  grassMaterial.color.multiply(new THREE.Color().setRGB(0.7, 0.82, 0.88));
   let currentPit = createInitialPitState();
   let groundOriginX = 0;
   let groundOriginZ = 0;
@@ -267,7 +276,7 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
   fill.count = 0;
   fill.receiveShadow = true;
   pit.add(fill);
-  const rimPebbles = new THREE.InstancedMesh(rockGeometry, stoneMaterials[2], 26);
+  const rimPebbles = new THREE.InstancedMesh(rockGeometry, stoneMaterials[2], 11);
   rimPebbles.name = "pit-edge-pebbles";
   const transform = new THREE.Object3D();
   const setMatrix = (mesh: THREE.InstancedMesh, index: number, x: number, y: number, z: number, sx: number, sy: number, sz: number, rotation = 0) => {
@@ -278,10 +287,10 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
     mesh.setMatrixAt(index, transform.matrix);
   };
   for (let index = 0; index < rimPebbles.count; index += 1) {
-    const angle = index / rimPebbles.count * Math.PI * 2;
-    const radius = PIT_RADIUS + 0.25 + Math.sin(index * 4.1) * 0.12;
-    const size = 0.17 + (index % 4) * 0.05;
-    setMatrix(rimPebbles, index, Math.cos(angle) * radius, -0.03, Math.sin(angle) * radius, size * 1.4, size * 0.55, size, angle);
+    const angle = index < 6 ? -2.8 + index * 0.21 : 0.35 + (index - 6) * 0.28;
+    const radius = PIT_RADIUS + 0.23 + Math.sin(index * 4.1) * 0.13;
+    const size = 0.33 + (index % 4) * 0.075;
+    setMatrix(rimPebbles, index, Math.cos(angle) * radius, -0.022, Math.sin(angle) * radius, size * 1.25, size * 0.38, size, angle);
   }
   rimPebbles.instanceMatrix.needsUpdate = true;
   pit.add(rimPebbles);
@@ -305,91 +314,113 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
     const group = new THREE.Group();
     group.name = `monument-${monument.round}`;
     group.userData.monument = { ...monument, center: { ...monument.center } };
+    group.userData.monumentRound = monument.round;
     group.position.set(monument.center.x, 0, monument.center.z);
-    const monumentStone = roughMaterial(0xdfd4be);
-    const monumentAccent = roughMaterial(0xb0b9a0);
-    const base = new THREE.Mesh(new THREE.CylinderGeometry(monument.radius * 0.8, monument.radius * 0.9, 0.5, 40), roughMaterial(0xc6bfa9));
-    base.position.y = 0.22;
+    const style = (monument.round - 1) % 4;
+    const monumentStone = roughMaterial([0x847b65, 0x786e5a, 0x95856b, 0x718071][style]);
+    const monumentAccent = roughMaterial(0xc0b397);
+    const baseMaterial = roughMaterial(0xb9ad91);
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(monument.radius * 0.69, monument.radius * 0.78, 0.58, 32), baseMaterial);
+    base.position.y = 0.28;
     base.receiveShadow = true;
+    base.castShadow = true;
     group.add(base);
+    const edge = new THREE.Mesh(new THREE.CylinderGeometry(monument.radius * 0.76, monument.radius * 0.79, 0.15, 32), roughMaterial(0xd5c9aa));
+    edge.position.y = 0.1;
+    edge.receiveShadow = true;
+    group.add(edge);
     const sculpture = new THREE.Group();
     sculpture.name = "stone-sculpture";
-    sculpture.position.y = 0.45;
+    sculpture.position.y = 0.54;
+    sculpture.scale.setScalar(Math.min(1.45, 1 + (monument.round - 1) * 0.065));
     group.add(sculpture);
     const piece = (x: number, y: number, z: number, sx: number, sy: number, sz: number, tilt = 0, accent = false) => {
-      // Geometry is owned by each monument, allowing old landmarks to release
-      // their resources without disposing the live pickable stone geometry.
       const mesh = new THREE.Mesh(rockGeometry.clone(), accent ? monumentAccent : monumentStone);
       mesh.position.set(x, y, z);
       mesh.scale.set(sx, sy, sz);
-      mesh.rotation.set(0.09, monument.round * 0.7, tilt);
+      mesh.rotation.set(0.025, 0.15, tilt);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       sculpture.add(mesh);
+      return mesh;
     };
-    const style = (monument.round - 1) % 4;
     if (style === 0) {
-      // A patient little stone person, sitting with its hands in its lap.
-      piece(-0.62, 0.45, 0.25, 2.1, 0.85, 1.45, -0.12);
-      piece(0.62, 0.45, 0.25, 2.1, 0.85, 1.45, 0.12);
-      piece(0, 1.35, 0, 2.05, 2.5, 1.35);
-      piece(0, 2.95, 0, 1.8, 1.8, 1.6, -0.08);
-      piece(-0.87, 1.4, 0.37, 0.65, 1.65, 0.8, -0.48);
-      piece(0.87, 1.4, 0.37, 0.65, 1.65, 0.8, 0.48);
-      piece(0, 0.99, 0.83, 1.3, 0.55, 0.65, 0, true);
-    } else if (style === 1) {
-      // An impossible, pleasing balance of smooth river stones.
-      piece(0, 0.45, 0, 3.8, 0.9, 2.5);
-      piece(-0.13, 1.35, 0, 2.4, 1.25, 1.85, -0.15);
-      piece(0.2, 2.27, 0, 3.1, 0.95, 1.6, 0.14);
-      piece(-0.2, 3.16, 0, 1.7, 1.2, 1.4, -0.19);
-      piece(0.03, 4.04, 0, 1.06, 0.94, 1.03, 0, true);
-    } else if (style === 2) {
-      // A doorway made together, with daylight visible through the middle.
-      for (let index = 0; index < 3; index += 1) {
-        piece(-1.35, 0.55 + index * 0.85, 0, 1.7, 1.4, 1.6, 0.08 * (index % 2));
-        piece(1.35, 0.55 + index * 0.85, 0, 1.7, 1.4, 1.6, -0.08 * (index % 2));
+      // The first statue is unmistakably someone resting: folded legs, one
+      // hand in the lap, and a tilted head resting against the other hand.
+      piece(-0.71, 0.5, 0.45, 2.5, 1, 1.7, -0.15);
+      piece(0.71, 0.5, 0.45, 2.5, 1, 1.7, 0.15);
+      piece(0.12, 2.04, 0, 2.9, 3.45, 1.85, -0.07);
+      piece(-0.22, 4.18, 0.08, 2.15, 2.08, 1.93, -0.15);
+      piece(1.12, 1.93, 0.23, 0.85, 2.55, 0.95, 0.31);
+      piece(-1.04, 2.48, 0.57, 0.83, 2.42, 0.85, -0.31);
+      piece(-0.62, 3.46, 0.6, 0.74, 1.13, 0.85, -0.26);
+      piece(0.36, 1.03, 1.04, 1.4, 0.68, 0.9, -0.1, true);
+      // Carved closed eyes make the gesture legible in a close-up.
+      const faceMaterial = roughMaterial(0x514d3f);
+      for (const x of [-0.47, 0.01]) {
+        const eye = new THREE.Mesh(new THREE.CapsuleGeometry(0.035, 0.19, 3, 6), faceMaterial);
+        eye.rotation.z = Math.PI / 2 - 0.12;
+        eye.position.set(x, 4.23, 0.91);
+        sculpture.add(eye);
       }
-      piece(-0.79, 3.04, 0, 2.5, 1.17, 1.6, -0.34);
-      piece(0.79, 3.04, 0, 2.5, 1.17, 1.6, 0.34);
-      piece(0, 3.65, 0, 1.4, 1.13, 1.4, 0, true);
+    } else if (style === 1) {
+      // Wide, off-centre stones look improbable, like a small act of trust.
+      piece(0, 0.47, 0, 4.05, 1.02, 2.7, 0.05);
+      piece(-0.46, 1.48, 0.03, 2.36, 1.62, 2.15, -0.19);
+      piece(0.36, 2.62, 0.02, 4.1, 1.12, 2.03, 0.13);
+      piece(0.81, 3.66, 0, 1.72, 1.54, 1.53, 0.18);
+      piece(0.44, 4.75, 0, 2.38, 0.99, 1.46, -0.2);
+      piece(-0.03, 5.38, 0, 0.87, 0.73, 0.91, 0, true);
+    } else if (style === 2) {
+      // The arch has clear negative space, broad shoulders and one keystone.
+      for (let index = 0; index < 3; index += 1) {
+        piece(-1.57, 0.63 + index * 1.12, 0, 1.84, 1.7, 2.02, -0.06 + index * 0.02);
+        piece(1.57, 0.63 + index * 1.12, 0, 1.84, 1.7, 2.02, 0.06 - index * 0.02);
+      }
+      piece(-0.94, 4.02, 0, 2.65, 1.52, 1.89, -0.36);
+      piece(0.94, 4.02, 0, 2.65, 1.52, 1.89, 0.36);
+      piece(0, 4.91, 0, 1.46, 1.39, 1.73, 0, true);
     } else {
-      // A friendly stone bird surveying the next patch of waiting.
-      piece(0, 0.4, 0, 3.4, 0.9, 2.25);
-      piece(0, 1.75, 0, 2.7, 2.85, 1.9);
-      piece(0.45, 3.1, 0, 1.9, 1.55, 1.8);
-      piece(1.27, 3.03, 0.14, 1.25, 0.4, 0.64, -0.1, true);
-      piece(-0.38, 1.94, 0.79, 1.5, 1.9, 0.45, -0.6, true);
-      piece(-1.08, 1.14, -0.14, 1.9, 0.9, 0.8, -0.45);
+      // A broad, carved bird gives the park another recognizable silhouette.
+      piece(0, 0.43, 0, 3.7, 0.95, 2.75);
+      piece(-0.04, 2.04, 0, 3.1, 3.6, 2.5, -0.11);
+      piece(0.55, 3.79, 0.02, 2.27, 1.98, 2.03, 0.1);
+      piece(1.63, 3.76, 0.15, 1.58, 0.63, 0.8, -0.11, true);
+      piece(-0.51, 2.19, 1.04, 1.71, 2.23, 0.49, -0.57, true);
+      piece(-1.34, 1.11, -0.15, 2.01, 1.07, 1.01, -0.47);
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.095, 8, 6), roughMaterial(0x344738));
+      eye.position.set(0.73, 4.02, 0.85);
+      sculpture.add(eye);
     }
-    group.add(monumentPlaque(monument));
+    group.traverse((object) => { object.userData.monumentRound = monument.round; });
+    group.updateMatrixWorld(true);
+    group.userData.labelHeight = new THREE.Box3().setFromObject(group).max.y + 0.65;
     monuments.set(monument.round, group);
     monumentRoot.add(group);
     return group;
   };
 
-  // Fixed instance capacities prevent long walks from growing the scene.
+  // Composition comes from a few planted groves, not uniform random scatter.
+  // Geometry and instance capacities stay fixed on long walks.
   const scenery = new THREE.Group();
   scenery.name = "meadow-scenery";
   root.add(scenery);
-  const leafGeometry = new THREE.IcosahedronGeometry(1, 2);
-  const trunkGeometry = new THREE.CylinderGeometry(0.11, 0.2, 1, 7);
-  const foliage = new THREE.InstancedMesh(leafGeometry, roughMaterial(WORLD_COLORS.leaf), 84);
+  const leafGeometry = new THREE.IcosahedronGeometry(1, 1);
+  const leafMaterial = roughMaterial(WORLD_COLORS.leaf);
+  const trunkGeometry = new THREE.CylinderGeometry(0.15, 0.23, 1, 8);
+  const foliage = new THREE.InstancedMesh(leafGeometry, leafMaterial, 84);
+  foliage.castShadow = true;
+  foliage.receiveShadow = true;
   const trunks = new THREE.InstancedMesh(trunkGeometry, roughMaterial(WORLD_COLORS.bark), 28);
+  trunks.castShadow = true;
   const bushes = new THREE.InstancedMesh(leafGeometry, roughMaterial(WORLD_COLORS.leafLight), 72);
-  const grassGeometry = new THREE.BufferGeometry();
-  grassGeometry.setAttribute("position", new THREE.Float32BufferAttribute([
-    -0.12, 0, 0, 0.04, 0.48, 0, 0.1, 0, 0,
-    0, 0, -0.12, 0, 0.38, -0.07, 0, 0, 0.13,
-  ], 3));
-  grassGeometry.computeVertexNormals();
-  const tuftMaterial = roughMaterial(WORLD_COLORS.grassDark);
-  tuftMaterial.side = THREE.DoubleSide;
-  const grass = new THREE.InstancedMesh(grassGeometry, tuftMaterial, 440);
-  const flowerGeometry = new THREE.IcosahedronGeometry(0.1, 0);
-  const flowers = new THREE.InstancedMesh(flowerGeometry, roughMaterial(0xf3e6bf), 160);
+  bushes.castShadow = true;
+  bushes.receiveShadow = true;
+  const patchMaterial = new THREE.MeshBasicMaterial({ color: 0x738a59, transparent: true, opacity: 0.19, depthWrite: false, toneMapped: false });
+  const patches = new THREE.InstancedMesh(parkPatchGeometry(), patchMaterial, 64);
+  patches.name = "park-moss-beds";
   const shadowMap = shadowTexture();
-  const contactMaterial = new THREE.MeshBasicMaterial({ map: shadowMap, color: shadowMap ? 0xffffff : 0x778267, transparent: true, opacity: shadowMap ? 1 : 0.12, depthWrite: false });
+  const contactMaterial = new THREE.MeshBasicMaterial({ map: shadowMap, color: shadowMap ? 0xffffff : 0x677455, transparent: true, opacity: shadowMap ? 1.25 : 0.15, depthWrite: false });
   const contactGeometry = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
   const sceneryShadows = new THREE.InstancedMesh(contactGeometry, contactMaterial, 100);
   const stoneShadows = new THREE.InstancedMesh(contactGeometry, contactMaterial, 96);
@@ -399,11 +430,57 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
   foliage.name = "meadow-tree-canopies";
   trunks.name = "meadow-tree-trunks";
   bushes.name = "meadow-bushes";
-  grass.name = "meadow-grass-tufts";
-  flowers.name = "meadow-flowers";
   sceneryShadows.name = "meadow-contact-shadows";
-  scenery.add(foliage, trunks, bushes, grass, flowers, sceneryShadows);
+  scenery.add(patches, sceneryShadows, foliage, trunks, bushes);
+  const paths = new THREE.Group();
+  paths.name = "park-walking-paths";
+  const pathMaterial = roughMaterial(0xc9bc99);
+  pathMaterial.color.multiplyScalar(0.83);
+  pathMaterial.transparent = true;
+  pathMaterial.opacity = 0.65;
+  pathMaterial.depthWrite = false;
+  root.add(paths);
+  const rebuildPaths = () => {
+    for (const child of [...paths.children]) {
+      if (child instanceof THREE.Mesh) child.geometry.dispose();
+      paths.remove(child);
+    }
+    const c = currentPit.center;
+    const approachZ = currentPit.radius + 3.6;
+    const curves: THREE.Vector3[][] = [[
+      new THREE.Vector3(c.x + 8, 0, c.z + 34),
+      new THREE.Vector3(c.x + 6.5, 0, c.z + 23),
+      new THREE.Vector3(c.x + 2.5, 0, c.z + 14),
+      new THREE.Vector3(c.x + 0.8, 0, c.z + approachZ),
+    ]];
+    if (currentPit.monuments.length) {
+      const recent = currentPit.monuments.slice(-4);
+      curves.push([
+        new THREE.Vector3(recent[0].center.x - 4, 0, recent[0].radius + 4.4),
+        ...recent.map((monument) => new THREE.Vector3(monument.center.x, 0, monument.radius + 4.4)),
+        new THREE.Vector3(c.x - 9, 0, approachZ + 0.5),
+        new THREE.Vector3(c.x + 0.8, 0, approachZ),
+      ]);
+    }
+    for (const [index, points] of curves.entries()) {
+      const mesh = new THREE.Mesh(parkPathGeometry(points, index ? 2.4 : 2.7), pathMaterial);
+      mesh.name = index ? "statue-promenade" : "meadow-entrance-path";
+      mesh.receiveShadow = true;
+      paths.add(mesh);
+      // A worn trail terminates in a rounded patch of soil, never a floating
+      // rectangular ribbon end beside the excavation.
+      for (const end of [points[0], points[points.length - 1]]) {
+        const cap = new THREE.Mesh(parkPatchGeometry(), pathMaterial);
+        cap.name = "worn-path-end";
+        cap.position.set(end.x, -0.008, end.z);
+        cap.scale.set(index ? 1.2 : 1.35, 1, index ? 1.2 : 1.35);
+        cap.receiveShadow = true;
+        paths.add(cap);
+      }
+    }
+  };
   let sceneryTile = "";
+  let sceneryViewAngle = Math.atan2(9, 31);
   const isClear = (x: number, z: number, clearance: number) => {
     if (Math.hypot(x - currentPit.center.x, z - currentPit.center.z) < currentPit.radius + clearance) return false;
     for (const monument of currentPit.monuments) {
@@ -412,60 +489,84 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
     return true;
   };
   const populateScenery = (playerX: number, playerZ: number) => {
-    const tileX = Math.floor(playerX / 24);
-    const tileZ = Math.floor(playerZ / 24);
-    const key = `${tileX}:${tileZ}:${currentPit.round}`;
+    const tileX = Math.floor(playerX / 48);
+    const tileZ = Math.floor(playerZ / 48);
+    const viewBucket = Math.round(sceneryViewAngle / 0.08);
+    const key = `${tileX}:${tileZ}:${currentPit.round}:${viewBucket}`;
     if (key === sceneryTile) return;
     sceneryTile = key;
-    const seed = Math.imul(tileX + 673, 0x45d9f3b) ^ Math.imul(tileZ - 137, 0x119de1f3);
-    const random = randomSequence(seed);
-    const originX = tileX * 24 + 12;
-    const originZ = tileZ * 24 + 12;
-    let treeCount = 0;
-    let bushCount = 0;
-    let shadowCount = 0;
-    for (let index = 0; index < trunks.instanceMatrix.count; index += 1) {
-      const angle = random() * Math.PI * 2;
-      const radius = 29 + random() * 60;
-      const x = originX + Math.cos(angle) * radius;
-      const z = originZ + Math.sin(angle) * radius;
-      if (!isClear(x, z, 20)) continue;
-      const size = 1.45 + random() * 1.45;
-      setMatrix(trunks, treeCount, x, size * 1.1, z, size, size * 2.2, size);
-      setMatrix(foliage, treeCount * 3, x, size * 2.7, z, size * 1.35, size * 1.4, size * 1.2, random() * 2);
-      setMatrix(foliage, treeCount * 3 + 1, x - size * 0.68, size * 2.18, z + size * 0.18, size, size * 1.12, size, random() * 2);
-      setMatrix(foliage, treeCount * 3 + 2, x + size * 0.77, size * 2.37, z - size * 0.07, size * 0.88, size * 1.04, size * 0.94, random() * 2);
-      for (let leaf = 0; leaf < 3; leaf += 1) foliage.setColorAt(treeCount * 3 + leaf, new THREE.Color().setHSL(0.29 + random() * 0.03, 0.17, 0.68 + random() * 0.13));
-      setMatrix(sceneryShadows, shadowCount++, x + 0.8, -0.013, z - 0.5, size * 4.8, 1, size * 3.6);
-      treeCount += 1;
-    }
-    for (let index = 0; index < bushes.instanceMatrix.count; index += 1) {
-      const x = originX + (random() - 0.5) * 140;
-      const z = originZ + (random() - 0.5) * 140;
-      if (!isClear(x, z, 19)) continue;
-      const size = 0.45 + random() * 0.85;
-      setMatrix(bushes, bushCount++, x, size * 0.46, z, size * 1.35, size * 0.72, size, random() * 3);
-      setMatrix(sceneryShadows, shadowCount++, x, -0.012, z, size * 3.4, 1, size * 2.8);
-    }
-    let grassCount = 0;
-    let flowerCount = 0;
-    for (let index = 0; index < grass.instanceMatrix.count; index += 1) {
-      const x = originX + (random() - 0.5) * 122;
-      const z = originZ + (random() - 0.5) * 122;
-      if (!isClear(x, z, 1.2)) continue;
-      const size = 0.6 + random() * 0.75;
-      setMatrix(grass, grassCount++, x, 0, z, size, size, size, random() * Math.PI);
-      if (random() > 0.63 && flowerCount < flowers.instanceMatrix.count) {
-        setMatrix(flowers, flowerCount++, x + 0.06, size * 0.36, z, size, size * 0.6, size);
+    const sites = [currentPit, ...currentPit.monuments.slice().reverse()];
+    const groves: { x: number; z: number; size: number; seed: number }[] = [];
+    for (const site of sites) {
+      if (Math.hypot(playerX - site.center.x, playerZ - site.center.z) > 68) continue;
+      const margin = site.radius + 10.2;
+      for (let index = 0; index < 8; index += 1) {
+        const angle = index / 8 * Math.PI * 2 + 0.18;
+        const x = Math.sin(angle) * margin;
+        const z = Math.cos(angle) * margin;
+        // Fixed park positions are shared by every visitor. Hide the near
+        // foreground sector so a crown cannot sit over the local hero.
+        const towardCamera = (x * Math.sin(sceneryViewAngle) + z * Math.cos(sceneryViewAngle)) / margin;
+        if (towardCamera > 0.14) continue;
+        groves.push({ x: site.center.x + x, z: site.center.z + z, size: 0.83 + (index % 3) * 0.12, seed: site.round * 71 + index * 37 });
       }
     }
-    foliage.count = treeCount * 3;
+    // Only travellers outside the sculptural park need the distant grove pool.
+    if (!groves.length) {
+      for (let index = 0; index < 6; index += 1) {
+        const angle = index / 6 * Math.PI * 2 + 0.35;
+        groves.push({ x: tileX * 48 + Math.cos(angle) * 38, z: tileZ * 48 + Math.sin(angle) * 38, size: 0.9 + (index % 3) * 0.15, seed: tileX * 673 + tileZ * 137 + index });
+      }
+    }
+    let treeCount = 0;
+    let bushCount = 0;
+    let patchCount = 0;
+    let shadowCount = 0;
+    for (const grove of groves.slice(0, 9)) {
+      if (!isClear(grove.x, grove.z, 4.5)) continue;
+      const random = randomSequence(grove.seed);
+      // Broad tonal beds tie each family of trees to a designed place.
+      setMatrix(patches, patchCount++, grove.x, -0.015, grove.z, 6.5 * grove.size, 1, 4.7 * grove.size, 0.5 + random());
+      setMatrix(patches, patchCount++, grove.x + 2, -0.014, grove.z - 2, 4.9 * grove.size, 1, 5.3 * grove.size, -0.4);
+      for (const [index, offset] of [[0, 0], [-2.1, -2.6], [2.55, -1.6]].entries()) {
+        if (treeCount >= trunks.instanceMatrix.count) break;
+        const size = grove.size * [1.12, 0.78, 0.92][index];
+        const x = grove.x + offset[0];
+        const z = grove.z + offset[1];
+        setMatrix(trunks, treeCount, x, size * 1.75, z, size, size * 3.5, size);
+        // Taller hand-carved crowns with an off-centre shoulder, avoiding
+        // identical spherical lollipop silhouettes.
+        setMatrix(foliage, treeCount * 2, x - size * 0.15, size * 4.35, z, size * 1.65, size * 2.15, size * 1.46, -0.2 + random() * 0.4);
+        setMatrix(foliage, treeCount * 2 + 1, x + size * 0.8, size * 3.52, z + size * 0.08, size * 1.13, size * 1.42, size * 1.05, 0.7);
+        const tint = new THREE.Color().setHSL(0.23 + random() * 0.035, 0.12, 0.73 + random() * 0.13);
+        foliage.setColorAt(treeCount * 2, tint);
+        foliage.setColorAt(treeCount * 2 + 1, tint);
+        setMatrix(sceneryShadows, shadowCount++, x + 1.4, -0.01, z - 0.4, size * 6.4, 1, size * 4.7);
+        treeCount += 1;
+      }
+      // Shrubs occur in generous uneven families at the edges of groves.
+      for (let index = 0; index < 4; index += 1) {
+        if (bushCount >= bushes.instanceMatrix.count) break;
+        const angle = 0.6 + index * 0.85;
+        const size = grove.size * (0.65 + random() * 0.48);
+        const x = grove.x + Math.cos(angle) * (3.4 + random());
+        const z = grove.z + Math.sin(angle) * 2.8;
+        setMatrix(bushes, bushCount++, x, size * 0.65, z, size * 1.35, size * 0.88, size, angle);
+        setMatrix(sceneryShadows, shadowCount++, x, -0.009, z, size * 3.5, 1, size * 2.5);
+      }
+    }
+    // Large, quiet color areas shape the meadow while leaving the action clear.
+    for (const [x, z, sx, sz, angle] of [[-11, 12, 6.1, 4.2, -0.5], [14, 10, 5.3, 7.4, 0.4], [-18, -19, 9, 5.6, 0.1]]) {
+      const px = currentPit.center.x + x;
+      const pz = currentPit.center.z + z;
+      if (isClear(px, pz, Math.min(sx, sz) * 0.8)) setMatrix(patches, patchCount++, px, -0.016, pz, sx, 1, sz, angle);
+    }
+    foliage.count = treeCount * 2;
     trunks.count = treeCount;
     bushes.count = bushCount;
-    grass.count = grassCount;
-    flowers.count = flowerCount;
+    patches.count = patchCount;
     sceneryShadows.count = shadowCount;
-    for (const mesh of [foliage, trunks, bushes, grass, flowers, sceneryShadows]) {
+    for (const mesh of [foliage, trunks, bushes, patches, sceneryShadows]) {
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
       mesh.computeBoundingSphere();
@@ -504,6 +605,7 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
       ground.geometry.dispose();
       ground.geometry = meadowGeometry(next, groundOriginX, groundOriginZ);
       sceneryTile = "";
+      rebuildPaths();
     }
     const fraction = Math.max(0, Math.min(1, next.count / Math.max(1, next.capacity)));
     const count = next.count === 0 ? 0 : Math.max(1, Math.round(fraction * 180));
@@ -540,12 +642,14 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
   };
 
   setPit(currentPit);
+  rebuildPaths();
   populateScenery(0, 0);
   return {
     root,
     ground,
     pitTarget,
     stones,
+    monuments,
     setStone(descriptor, visible = true) {
       let mesh = stones.get(descriptor.id);
       if (!mesh) {
@@ -571,11 +675,12 @@ export function createWaitingWorld(scene: THREE.Scene): WaitingWorld {
       marker.visible = id !== null && !!stones.get(id)?.visible;
     },
     burst,
-    update(elapsedSeconds, playerX = 0, playerZ = 0) {
+    update(elapsedSeconds, playerX = 0, playerZ = 0, viewAngle = sceneryViewAngle) {
       if (disposed) return;
       elapsed = Number.isFinite(elapsedSeconds) ? elapsedSeconds : elapsed;
       const safeX = Number.isFinite(playerX) ? playerX : 0;
       const safeZ = Number.isFinite(playerZ) ? playerZ : 0;
+      if (Number.isFinite(viewAngle)) sceneryViewAngle = viewAngle;
       sun.position.set(safeX - 24, 38, safeZ + 18);
       sun.target.position.set(safeX, 0, safeZ);
       const nextOriginX = Math.round(safeX / 128) * 128;

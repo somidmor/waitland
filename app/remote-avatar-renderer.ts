@@ -233,7 +233,13 @@ function makeWingGeometry() {
   shape.bezierCurveTo(1.04, 0.22, 0.91, 0.12, 0.73, 0.17);
   shape.bezierCurveTo(0.72, 0.01, 0.54, -0.06, 0.39, 0.06);
   shape.bezierCurveTo(0.28, -0.06, 0.12, -0.04, 0, 0.02);
-  const geometry = new THREE.ShapeGeometry(shape, 8);
+  // Volume preserves the white feather silhouette when a departure is viewed
+  // from the side; a flat shape vanished edge-on at several arrival headings.
+  const geometry = new THREE.ExtrudeGeometry(shape, {
+    depth: 0.24, bevelEnabled: true, bevelThickness: 0.09,
+    bevelSize: 0.06, bevelSegments: 2, steps: 1, curveSegments: 8,
+  });
+  geometry.translate(0, 0, -0.12);
   geometry.computeVertexNormals();
   return geometry;
 }
@@ -291,7 +297,7 @@ export class RemoteAvatarRenderer {
   private readonly mouthMaterial = new THREE.MeshBasicMaterial({ color: 0x5b352b });
   private readonly shadowMaterial = new THREE.MeshBasicMaterial({ color: 0x302714, transparent: true, opacity: 0.17, depthWrite: false });
   private readonly stoneMaterial = new THREE.MeshStandardMaterial({ color: 0x8f887a, roughness: 0.98 });
-  private readonly wingMaterial = new THREE.MeshStandardMaterial({ color: 0xfff9e9, emissive: 0x6b552b, emissiveIntensity: 0.08, roughness: 0.88, side: THREE.DoubleSide });
+  private readonly wingMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 0.12, roughness: 0.88, side: THREE.DoubleSide });
   private readonly moteMaterial = new THREE.MeshBasicMaterial({ color: 0xfff6d8, transparent: true, opacity: 0.78, depthWrite: false });
 
   private readonly bodies: THREE.InstancedMesh;
@@ -883,7 +889,7 @@ export class RemoteAvatarRenderer {
       if (departing) {
         const flap = Math.sin(departureT * Math.PI * 12) * 0.34;
         const opening = Math.sin(Math.min(1, departureT * 5) * Math.PI * 0.5);
-        const wingScale = 0.72 + opening * 0.54;
+        const wingScale = 0.8 + opening * 0.72;
         this.setPart(this.leftWings, wingCount, this.rootMatrix, -0.2, 1.77, 0.34, 0, -0.22 - flap, -0.18, -wingScale, wingScale, wingScale);
         this.setPart(this.rightWings, wingCount, this.rootMatrix, 0.2, 1.77, 0.34, 0, 0.22 + flap, 0.18, wingScale, wingScale, wingScale);
         wingCount += 1;

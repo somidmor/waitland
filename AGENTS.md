@@ -44,8 +44,10 @@ when the application moved to native Cloudflare Workers.
 - `app/`
   - `page.tsx` and `game-loader.tsx`: application entry and client loading.
   - `arrival-screen.tsx`: no-account arrival/profile flow.
-  - `waiting-pit.tsx`: minimal React HUD, nearby bubbles, menu, and departure screen.
-  - `game-engine.ts`: Three.js loop, input, pickup/throw, realtime integration.
+  - `waiting-pit.tsx`: park-sign HUD, collision-aware screen labels, nearby
+    bubbles, statue inspector/index, menu, and departure screen.
+  - `game-engine.ts`: Three.js loop, arrival-relative camera, local identity
+    ring, statue picking/framing, input, pickup/throw, and realtime integration.
   - `game-navigation.ts`: tap-to-walk routing around the active pit.
   - `game-audio.ts`: optional synthesized stone sounds with no audio downloads.
   - `pit-geometry.ts`: the shared irregular excavation contours used by the
@@ -108,7 +110,10 @@ stones, or chat into database polling.
 8. Leaving displays a white-wing flight animation. Do not restore visible
    sleeping avatars.
 9. Preserve graceful local-only play when realtime is unavailable.
-10. Keep controls reachable around iOS/Android safe areas and usable with touch,
+10. Keep the local visitor unmistakable: persistent screen-space YOU flag,
+    contrasting ground ring, and deliberate outfit. Monument and speech labels
+    must avoid the hero, and statue text must stay readable at screen size.
+11. Keep controls reachable around iOS/Android safe areas and usable with touch,
     keyboard, and pointer input where already supported.
 
 ## Durable Object state preservation
